@@ -1,6 +1,6 @@
 """
 ERB Tech - Cliente BigQuery
-VERSÃO FINAL DEFINITIVA - Baseada 100% no notebook original
+VERSÃO FINAL v4 - Corrige tipos STRING para campos de leitura
 """
 
 import streamlit as st
@@ -64,19 +64,47 @@ def execute_query(query: str, params: Optional[Dict] = None) -> pd.DataFrame:
 
 def normalize_for_bigquery(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Normalização igual ao notebook original
+    Normalização COMPLETA para BigQuery
+    - Converte campos de texto para STRING
+    - Converte dias para Int64
+    - Substitui NaN por None
     """
     df = df.copy()
     
-    text_cols = ["leitura_anterior", "leitura_atual", "proxima_leitura", 
-                 "vencimento", "data_emissao", "referencia"]
-    for c in text_cols:
-        if c in df.columns:
-            df[c] = df[c].astype("string").str.strip().replace({"": None})
+    # IMPORTANTE: Campos que DEVEM ser STRING no BigQuery
+    string_cols = [
+        "leitura_anterior", "leitura_atual", "proxima_leitura",
+        "vencimento", "data_emissao", "referencia",
+        "unidade_consumidora", "cliente_numero", "nome", "cnpj", "cep",
+        "cidade_uf", "grupo_subgrupo_tensao", "numero", "serie",
+        "codigo", "descricao", "unidade", "id",
+        # Campos de medidores
+        "medidor", "tipo", "posto", "nota_fiscal_numero"
+    ]
     
+    for c in string_cols:
+        if c in df.columns:
+            # Converter para string, tratando None e NaN
+            df[c] = df[c].apply(lambda x: str(x).strip() if pd.notna(x) and x is not None else None)
+            # Substituir strings vazias por None
+            df[c] = df[c].replace({"": None, "None": None, "nan": None, "NaN": None})
+    
+    # Campos inteiros
     if "dias" in df.columns:
         df["dias"] = pd.to_numeric(df["dias"], errors="coerce").astype("Int64")
     
+    # Campos numéricos float
+    float_cols = [
+        "quantidade_registrada", "tarifa", "valor", "pis_valor", 
+        "cofins_base", "icms_aliquota", "icms_valor", "tarifa_sem_trib",
+        "total_pagar", "constante", "fator", "total_apurado"
+    ]
+    
+    for c in float_cols:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    
+    # Substituir NaN por None para todos os campos
     return df.replace({np.nan: None})
 
 
@@ -95,6 +123,8 @@ def upsert_dataframe(df: pd.DataFrame, table_id: str, key_column: str = "id") ->
     # IGUAL AO NOTEBOOK: drop_duplicates com keep="first"
     df_clean = df.drop_duplicates(subset=[key_column], keep="first").copy()
     df_clean = df_clean.dropna(subset=[key_column])
+    
+    # NORMALIZAÇÃO CRÍTICA
     df_clean = normalize_for_bigquery(df_clean)
     
     if df_clean.empty:
