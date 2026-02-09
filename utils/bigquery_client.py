@@ -1,17 +1,24 @@
 """
 ERB Tech - Cliente BigQuery
-VERSÃO FINAL v5 - Força schema no staging + garante STRING para campos de leitura
+VERSÃO FINAL v6 - UPSERT robusto (chave única determinística) + staging com UUID
 """
 
-import streamlit as st
-import pandas as pd
+from __future__ import annotations
+
+import uuid
+from typing import Optional, List, Dict
+
 import numpy as np
+import pandas as pd
+import streamlit as st
 from google.cloud import bigquery
 from google.oauth2 import service_account
-from typing import Optional, List, Dict
-import time
 
-# Configurações
+
+# =============================================================================
+# CONFIGURAÇÕES
+# =============================================================================
+
 PROJECT_ID = "football-data-science"
 DATASET_ID = "erb_tech"
 LOCATION = "southamerica-east1"
@@ -24,9 +31,13 @@ TABLE_BOLETOS = f"{PROJECT_ID}.{DATASET_ID}.boletos_calculados"
 TABLE_EDIT_LOG = f"{PROJECT_ID}.{DATASET_ID}.edit_log"
 
 
+# =============================================================================
+# CLIENT / QUERY
+# =============================================================================
+
 @st.cache_resource
 def get_bigquery_client() -> bigquery.Client:
-    """Cria e retorna um cliente BigQuery"""
+    """Cria e retorna um cliente BigQuery."""
     try:
         credentials = service_account.Credentials.from_service_account_info(
             st.secrets["gcp_service_account"]
@@ -42,7 +53,7 @@ def get_bigquery_client() -> bigquery.Client:
 
 
 def execute_query(query: str, params: Optional[Dict] = None) -> pd.DataFrame:
-    """Executa uma query SQL e retorna um DataFrame"""
+    """Executa uma query SQL e retorna um DataFrame."""
     client = get_bigquery_client()
 
     if params:
@@ -59,10 +70,14 @@ def execute_query(query: str, params: Optional[Dict] = None) -> pd.DataFrame:
     return query_job.to_dataframe()
 
 
+# =============================================================================
+# NORMALIZAÇÃO / UTILITÁRIOS
+# =============================================================================
+
 def _ensure_string_dtype(series: pd.Series) -> pd.Series:
     """
     Converte para dtype 'string' do pandas, preservando NULLs como <NA>/None.
-    Isso evita o BigQuery inferir INT64 quando só tem números.
+    Isso evita o BigQuery inferir INT64 quando só tem números (ex.: leituras).
     """
     s = series.copy()
 
@@ -78,7 +93,7 @@ def _ensure_string_dtype(series: pd.Series) -> pd.Series:
     # Normaliza vazios para NA
     s = s.replace({"": pd.NA, "None": pd.NA, "nan": pd.NA, "NaN": pd.NA})
 
-    # Converte NA para None (BigQuery python client gosta mais de None do que <NA>)
+    # Converte NA para None (BigQuery python client prefere None ao <NA>)
     return s.astype(object).where(s.notna(), None)
 
 
@@ -136,12 +151,82 @@ def normalize_for_bigquery(df: pd.DataFrame) -> pd.DataFrame:
     return df.replace({np.nan: None})
 
 
+def _make_key_unique_deterministically(df: pd.DataFrame, key_column: str) -> pd.DataFrame:
+    """
+    Garante que a coluna de chave (ex.: 'id') seja única dentro do DataFrame.
+
+    Por que isso existe?
+    - O MERGE do BigQuery exige no máximo 1 linha de origem por chave.
+    - O código v5 resolvia isso com drop_duplicates(...), mas isso REMOVE linhas reais
+      quando o parse gera IDs repetidos (muito comum quando há mais de um item com o
+      mesmo código e a mesma tarifa na fatura).
+    - Aqui, em vez de descartar, nós DESAMBIGUAMOS de forma determinística, adicionando
+      um sufixo "-<n>" apenas nas duplicatas.
+
+    Observação:
+    - Se a sua geração de 'id' já for única, nada muda.
+    - Se houver duplicatas, o primeiro registro mantém o id original e os demais viram
+      id-1, id-2, ...
+    """
+    if key_column not in df.columns or df.empty:
+        return df
+
+    df = df.copy()
+    df[key_column] = _ensure_string_dtype(df[key_column])
+
+    # Remove vazios (não dá para fazer UPSERT sem chave)
+    df = df[df[key_column].notna()].copy()
+    df = df[df[key_column].astype(str).str.strip() != ""].copy()
+
+    if df.empty:
+        return df
+
+    dup_mask = df[key_column].duplicated(keep=False)
+    if not dup_mask.any():
+        return df
+
+    # Ordenação determinística dentro de cada grupo duplicado
+    sort_candidates = [
+        "unidade_consumidora", "cliente_numero", "referencia",
+        "codigo", "descricao", "unidade",
+        "quantidade_registrada", "tarifa", "valor",
+        "pis_valor", "icms_aliquota", "icms_valor",
+        "vencimento", "data_emissao", "numero", "serie"
+    ]
+    sort_cols = [c for c in sort_candidates if c in df.columns]
+
+    if sort_cols:
+        df = df.sort_values(by=[key_column] + sort_cols, kind="mergesort").reset_index(drop=True)
+    else:
+        df = df.sort_values(by=[key_column], kind="mergesort").reset_index(drop=True)
+
+    df["__dup_idx"] = df.groupby(key_column).cumcount()
+
+    needs_suffix = df["__dup_idx"] > 0
+    df.loc[needs_suffix, key_column] = (
+        df.loc[needs_suffix, key_column].astype(str) + "-" + df.loc[needs_suffix, "__dup_idx"].astype(str)
+    )
+
+    df = df.drop(columns=["__dup_idx"])
+    df[key_column] = _ensure_string_dtype(df[key_column])
+    return df
+
+
+# =============================================================================
+# UPSERT
+# =============================================================================
+
 def upsert_dataframe(df: pd.DataFrame, table_id: str, key_column: str = "id") -> int:
     """
-    UPSERT via MERGE
-    FIX v5:
-      - staging table é carregada com schema do destino (subconjunto)
-      - evita inferência errada (ex.: leitura_anterior virar INT64)
+    UPSERT via MERGE.
+
+    Correções importantes (v6):
+      1) NÃO descarta linhas quando o parse gera chaves repetidas:
+         - v5 fazia drop_duplicates(subset=[id]), o que silenciosamente removia itens.
+         - v6 cria chaves únicas determinísticas para duplicatas (id-1, id-2, ...).
+      2) Staging table com UUID (evita colisão entre sessões/execuções no mesmo segundo).
+      3) Continua forçando o schema do staging com base no schema real da tabela destino
+         (sem inferência, preservando tipos/strings).
     """
     if df is None or df.empty:
         return 0
@@ -151,50 +236,47 @@ def upsert_dataframe(df: pd.DataFrame, table_id: str, key_column: str = "id") ->
 
     client = get_bigquery_client()
 
-    # Mantém lógica original
-    df_clean = df.drop_duplicates(subset=[key_column], keep="first").copy()
-    df_clean = df_clean.dropna(subset=[key_column])
+    # 1) Normalização crítica (tipos / None)
+    df_clean = normalize_for_bigquery(df)
 
-    # Normalização crítica
-    df_clean = normalize_for_bigquery(df_clean)
+    # 2) Garante chave presente e única (sem perder linhas)
+    df_clean = _make_key_unique_deterministically(df_clean, key_column)
 
     if df_clean.empty:
         return 0
 
-    # Staging table
-    ts = int(time.time())
-    staging_table_id = f"{table_id}__staging_{ts}"
+    # 3) Staging table (UUID evita colisão)
+    staging_suffix = uuid.uuid4().hex[:12]
+    staging_table_id = f"{table_id}__staging_{staging_suffix}"
 
-    # ---- NOVO: Força schema do staging com base no schema real da tabela destino
+    # 4) Força schema do staging com base no schema real da tabela destino
     dest_table = client.get_table(table_id)
     dest_schema_map = {f.name: f for f in dest_table.schema}
 
-    # Usa somente campos que existem no DataFrame (para não dar mismatch)
-    staging_schema = [dest_schema_map[c] for c in df_clean.columns if c in dest_schema_map]
-
-    # Se algum campo do DF não existe na tabela, melhor falhar com mensagem clara
     missing_in_dest = [c for c in df_clean.columns if c not in dest_schema_map]
     if missing_in_dest:
         raise ValueError(
             f"As colunas abaixo existem no DataFrame mas NÃO existem na tabela destino {table_id}: {missing_in_dest}"
         )
 
+    staging_schema = [dest_schema_map[c] for c in df_clean.columns]
+
     try:
-        # 1) Load para staging com schema explícito (sem inferência!)
+        # 5) Load para staging com schema explícito (sem inferência)
         job_config = bigquery.LoadJobConfig(
             schema=staging_schema,
-            write_disposition="WRITE_TRUNCATE"
+            write_disposition="WRITE_TRUNCATE",
         )
 
         load_job = client.load_table_from_dataframe(
             df_clean,
             staging_table_id,
             location=LOCATION,
-            job_config=job_config
+            job_config=job_config,
         )
         load_job.result()
 
-        # 2) MERGE
+        # 6) MERGE
         cols = list(df_clean.columns)
         non_key_cols = [c for c in cols if c != key_column]
 
@@ -223,7 +305,6 @@ def upsert_dataframe(df: pd.DataFrame, table_id: str, key_column: str = "id") ->
         return int(affected or len(df_clean))
 
     finally:
-        # 3) Limpa staging
         client.delete_table(staging_table_id, not_found_ok=True)
 
 
@@ -232,7 +313,7 @@ def upsert_dataframe(df: pd.DataFrame, table_id: str, key_column: str = "id") ->
 # =============================================================================
 
 def get_periodos_disponiveis() -> List[str]:
-    """Retorna lista de períodos disponíveis"""
+    """Retorna lista de períodos disponíveis."""
     query = f"""
     SELECT DISTINCT referencia
     FROM `{TABLE_FATURA_ITENS}`
@@ -245,7 +326,7 @@ def get_periodos_disponiveis() -> List[str]:
 
 
 def get_historico_cliente(unidade_consumidora: str, limite: int = 12) -> pd.DataFrame:
-    """Busca histórico de faturas de um cliente"""
+    """Busca histórico de faturas de um cliente."""
     query = f"""
     SELECT
         referencia as periodo,
