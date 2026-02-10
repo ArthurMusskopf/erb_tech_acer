@@ -1,12 +1,17 @@
 """
 ERB Tech - Cliente BigQuery
-VERSÃO FINAL v6 - UPSERT robusto (chave única determinística) + staging com UUID
+VERSÃO v7
+- Inclui 'classe_modalidade' em fatura_itens (STRING)
+- Suporta parâmetros ARRAY no execute_query (p/ checar clientes em lote)
+- Inclui n_fases (INT64) e custo_disp (INT64) na normalização quando existirem
+- Inclui status como STRING na normalização
+- Inclui helpers: checar clientes faltantes + formulário Streamlit de cadastro
 """
 
 from __future__ import annotations
 
 import uuid
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Any, Iterable
 
 import numpy as np
 import pandas as pd
@@ -23,7 +28,6 @@ PROJECT_ID = "football-data-science"
 DATASET_ID = "erb_tech"
 LOCATION = "southamerica-east1"
 
-# Tabelas
 TABLE_FATURA_ITENS = f"{PROJECT_ID}.{DATASET_ID}.fatura_itens"
 TABLE_MEDIDORES = f"{PROJECT_ID}.{DATASET_ID}.medidores_leituras"
 TABLE_CLIENTES = f"{PROJECT_ID}.{DATASET_ID}.info_clientes"
@@ -37,7 +41,6 @@ TABLE_EDIT_LOG = f"{PROJECT_ID}.{DATASET_ID}.edit_log"
 
 @st.cache_resource
 def get_bigquery_client() -> bigquery.Client:
-    """Cria e retorna um cliente BigQuery."""
     try:
         credentials = service_account.Credentials.from_service_account_info(
             st.secrets["gcp_service_account"]
@@ -52,17 +55,36 @@ def get_bigquery_client() -> bigquery.Client:
         raise
 
 
-def execute_query(query: str, params: Optional[Dict] = None) -> pd.DataFrame:
-    """Executa uma query SQL e retorna um DataFrame."""
+def _infer_bq_scalar_type(v: Any) -> str:
+    if isinstance(v, bool):
+        return "BOOL"
+    if isinstance(v, int) and not isinstance(v, bool):
+        return "INT64"
+    if isinstance(v, float):
+        return "FLOAT64"
+    return "STRING"
+
+
+def execute_query(query: str, params: Optional[Dict[str, Any]] = None) -> pd.DataFrame:
+    """
+    Executa SQL e retorna DataFrame.
+    v7: suporta params escalares e arrays (IN UNNEST(@param)).
+    """
     client = get_bigquery_client()
 
     if params:
-        job_config = bigquery.QueryJobConfig(
-            query_parameters=[
-                bigquery.ScalarQueryParameter(k, "STRING", v)
-                for k, v in params.items()
-            ]
-        )
+        qps = []
+        for k, v in params.items():
+            if isinstance(v, (list, tuple, set)):
+                vals = list(v)
+                # tenta inferir tipo pelo primeiro não-nulo
+                non_null = next((x for x in vals if x is not None), None)
+                item_type = _infer_bq_scalar_type(non_null) if non_null is not None else "STRING"
+                qps.append(bigquery.ArrayQueryParameter(k, item_type, vals))
+            else:
+                qps.append(bigquery.ScalarQueryParameter(k, _infer_bq_scalar_type(v), v))
+
+        job_config = bigquery.QueryJobConfig(query_parameters=qps)
         query_job = client.query(query, job_config=job_config)
     else:
         query_job = client.query(query)
@@ -71,110 +93,69 @@ def execute_query(query: str, params: Optional[Dict] = None) -> pd.DataFrame:
 
 
 # =============================================================================
-# NORMALIZAÇÃO / UTILITÁRIOS
+# NORMALIZAÇÃO
 # =============================================================================
 
 def _ensure_string_dtype(series: pd.Series) -> pd.Series:
-    """
-    Converte para dtype 'string' do pandas, preservando NULLs como <NA>/None.
-    Isso evita o BigQuery inferir INT64 quando só tem números (ex.: leituras).
-    """
     s = series.copy()
-
-    # Troca NaN/None por NA do pandas
     s = s.where(pd.notna(s), pd.NA)
-
-    # Converte para string sem transformar NA em "nan"/"None"
     s = s.astype("string")
-
-    # Trim
     s = s.str.strip()
-
-    # Normaliza vazios para NA
     s = s.replace({"": pd.NA, "None": pd.NA, "nan": pd.NA, "NaN": pd.NA})
-
-    # Converte NA para None (BigQuery python client prefere None ao <NA>)
     return s.astype(object).where(s.notna(), None)
 
 
 def normalize_for_bigquery(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Normalização COMPLETA para BigQuery
-    - Garante que campos textuais são realmente dtype string/object (evita inferência INT64)
-    - Converte dias para Int64
-    - Converte floats
-    - Substitui NaN por None
-    """
     df = df.copy()
 
-    # IMPORTANTE: Campos que DEVEM ser STRING no BigQuery
+    # Strings (inclui a nova classe_modalidade)
     string_cols = [
-        # Leituras / datas textuais
         "leitura_anterior", "leitura_atual", "proxima_leitura",
         "vencimento", "data_emissao", "referencia",
-
-        # Clientes
         "unidade_consumidora", "cliente_numero", "nome", "cnpj", "cnpj_cpf",
         "cep", "cidade_uf",
-
-        # Fatura/itens
-        "grupo_subgrupo_tensao", "numero", "serie",
+        "grupo_subgrupo_tensao", "classe_modalidade",  # <-- NOVO
+        "numero", "serie",
         "codigo", "descricao", "unidade", "id",
-
-        # Medidores
-        "medidor", "tipo", "posto", "nota_fiscal_numero"
+        "medidor", "tipo", "posto", "nota_fiscal_numero",
+        "status",  # <-- usuário
     ]
-
     for c in string_cols:
         if c in df.columns:
             df[c] = _ensure_string_dtype(df[c])
 
-    # Campos inteiros
-    if "dias" in df.columns:
-        df["dias"] = pd.to_numeric(df["dias"], errors="coerce").astype("Int64")
-        df["dias"] = df["dias"].where(df["dias"].notna(), None)
+    # Inteiros (v7: n_fases e custo_disp além de dias)
+    int_cols = ["dias", "n_fases", "custo_disp"]
+    for c in int_cols:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce").astype("Int64")
+            df[c] = df[c].where(df[c].notna(), None)
 
-    # Campos numéricos float
+    # Floats
     float_cols = [
         "quantidade_registrada", "tarifa", "valor", "pis_valor",
         "cofins_base", "icms_aliquota", "icms_valor", "tarifa_sem_trib",
         "total_pagar", "constante", "fator", "total_apurado",
         "subvencao", "desconto_contratado"
     ]
-
     for c in float_cols:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
             df[c] = df[c].where(df[c].notna(), None)
 
-    # Qualquer NaN remanescente -> None
     return df.replace({np.nan: None})
 
 
+# =============================================================================
+# UPSERT (MERGE)
+# =============================================================================
+
 def _make_key_unique_deterministically(df: pd.DataFrame, key_column: str) -> pd.DataFrame:
-    """
-    Garante que a coluna de chave (ex.: 'id') seja única dentro do DataFrame.
-
-    Por que isso existe?
-    - O MERGE do BigQuery exige no máximo 1 linha de origem por chave.
-    - O código v5 resolvia isso com drop_duplicates(...), mas isso REMOVE linhas reais
-      quando o parse gera IDs repetidos (muito comum quando há mais de um item com o
-      mesmo código e a mesma tarifa na fatura).
-    - Aqui, em vez de descartar, nós DESAMBIGUAMOS de forma determinística, adicionando
-      um sufixo "-<n>" apenas nas duplicatas.
-
-    Observação:
-    - Se a sua geração de 'id' já for única, nada muda.
-    - Se houver duplicatas, o primeiro registro mantém o id original e os demais viram
-      id-1, id-2, ...
-    """
     if key_column not in df.columns or df.empty:
         return df
 
     df = df.copy()
     df[key_column] = _ensure_string_dtype(df[key_column])
-
-    # Remove vazios (não dá para fazer UPSERT sem chave)
     df = df[df[key_column].notna()].copy()
     df = df[df[key_column].astype(str).str.strip() != ""].copy()
 
@@ -185,13 +166,13 @@ def _make_key_unique_deterministically(df: pd.DataFrame, key_column: str) -> pd.
     if not dup_mask.any():
         return df
 
-    # Ordenação determinística dentro de cada grupo duplicado
     sort_candidates = [
         "unidade_consumidora", "cliente_numero", "referencia",
         "codigo", "descricao", "unidade",
         "quantidade_registrada", "tarifa", "valor",
         "pis_valor", "icms_aliquota", "icms_valor",
-        "vencimento", "data_emissao", "numero", "serie"
+        "vencimento", "data_emissao", "numero", "serie",
+        "classe_modalidade",
     ]
     sort_cols = [c for c in sort_candidates if c in df.columns]
 
@@ -212,44 +193,23 @@ def _make_key_unique_deterministically(df: pd.DataFrame, key_column: str) -> pd.
     return df
 
 
-# =============================================================================
-# UPSERT
-# =============================================================================
-
 def upsert_dataframe(df: pd.DataFrame, table_id: str, key_column: str = "id") -> int:
-    """
-    UPSERT via MERGE.
-
-    Correções importantes (v6):
-      1) NÃO descarta linhas quando o parse gera chaves repetidas:
-         - v5 fazia drop_duplicates(subset=[id]), o que silenciosamente removia itens.
-         - v6 cria chaves únicas determinísticas para duplicatas (id-1, id-2, ...).
-      2) Staging table com UUID (evita colisão entre sessões/execuções no mesmo segundo).
-      3) Continua forçando o schema do staging com base no schema real da tabela destino
-         (sem inferência, preservando tipos/strings).
-    """
     if df is None or df.empty:
         return 0
-
     if key_column not in df.columns:
         raise ValueError(f"DataFrame precisa da coluna '{key_column}'.")
 
     client = get_bigquery_client()
 
-    # 1) Normalização crítica (tipos / None)
     df_clean = normalize_for_bigquery(df)
-
-    # 2) Garante chave presente e única (sem perder linhas)
     df_clean = _make_key_unique_deterministically(df_clean, key_column)
 
     if df_clean.empty:
         return 0
 
-    # 3) Staging table (UUID evita colisão)
     staging_suffix = uuid.uuid4().hex[:12]
     staging_table_id = f"{table_id}__staging_{staging_suffix}"
 
-    # 4) Força schema do staging com base no schema real da tabela destino
     dest_table = client.get_table(table_id)
     dest_schema_map = {f.name: f for f in dest_table.schema}
 
@@ -262,7 +222,6 @@ def upsert_dataframe(df: pd.DataFrame, table_id: str, key_column: str = "id") ->
     staging_schema = [dest_schema_map[c] for c in df_clean.columns]
 
     try:
-        # 5) Load para staging com schema explícito (sem inferência)
         job_config = bigquery.LoadJobConfig(
             schema=staging_schema,
             write_disposition="WRITE_TRUNCATE",
@@ -276,7 +235,6 @@ def upsert_dataframe(df: pd.DataFrame, table_id: str, key_column: str = "id") ->
         )
         load_job.result()
 
-        # 6) MERGE
         cols = list(df_clean.columns)
         non_key_cols = [c for c in cols if c != key_column]
 
@@ -309,34 +267,144 @@ def upsert_dataframe(df: pd.DataFrame, table_id: str, key_column: str = "id") ->
 
 
 # =============================================================================
-# FUNÇÕES ESPECÍFICAS
+# DIMENSÃO: info_clientes (checagem + formulário)
 # =============================================================================
 
-def get_periodos_disponiveis() -> List[str]:
-    """Retorna lista de períodos disponíveis."""
-    query = f"""
-    SELECT DISTINCT referencia
-    FROM `{TABLE_FATURA_ITENS}`
-    WHERE referencia IS NOT NULL
-    ORDER BY referencia DESC
-    LIMIT 24
-    """
-    df = execute_query(query)
-    return df["referencia"].tolist() if not df.empty else []
+def infer_n_fases(classe_modalidade: Optional[str]) -> Optional[int]:
+    if not classe_modalidade:
+        return None
+    s = str(classe_modalidade).upper()
+    if "TRIF" in s:
+        return 3
+    if "BIF" in s:
+        return 2
+    if "MONOF" in s or "MONO" in s:
+        return 1
+    return None
 
 
-def get_historico_cliente(unidade_consumidora: str, limite: int = 12) -> pd.DataFrame:
-    """Busca histórico de faturas de um cliente."""
-    query = f"""
-    SELECT
-        referencia as periodo,
-        SUM(CASE WHEN codigo = '0D' THEN quantidade_registrada ELSE 0 END) as consumo_kwh,
-        SUM(CASE WHEN codigo IN ('0R', '0S') THEN ABS(quantidade_registrada) ELSE 0 END) as injetada_kwh,
-        MAX(total_pagar) as valor_fatura
-    FROM `{TABLE_FATURA_ITENS}`
-    WHERE unidade_consumidora = @uc
-    GROUP BY referencia
-    ORDER BY referencia DESC
-    LIMIT {limite}
+def infer_custo_disp(n_fases: Optional[int]) -> Optional[int]:
+    if n_fases == 3:
+        return 100
+    if n_fases == 2:
+        return 50
+    if n_fases == 1:
+        return 30
+    return None
+
+
+def get_clientes_existentes_por_uc(ucs: Iterable[str]) -> set:
+    ucs = [str(x).strip() for x in ucs if x is not None and str(x).strip()]
+    if not ucs:
+        return set()
+
+    q = f"""
+    SELECT DISTINCT unidade_consumidora
+    FROM `{TABLE_CLIENTES}`
+    WHERE unidade_consumidora IN UNNEST(@ucs)
     """
-    return execute_query(query, {"uc": unidade_consumidora})
+    df = execute_query(q, {"ucs": ucs})
+    return set(df["unidade_consumidora"].astype(str).tolist()) if not df.empty else set()
+
+
+def ucs_faltantes_no_cadastro(df_itens: pd.DataFrame) -> List[str]:
+    if df_itens is None or df_itens.empty or "unidade_consumidora" not in df_itens.columns:
+        return []
+
+    ucs = df_itens["unidade_consumidora"].dropna().astype(str).unique().tolist()
+    existentes = get_clientes_existentes_por_uc(ucs)
+    faltantes = [uc for uc in ucs if uc not in existentes]
+    return sorted(faltantes)
+
+
+def carregar_header_mais_recente_da_uc(df_itens: pd.DataFrame, uc: str) -> Dict[str, Any]:
+    """
+    Pega do DataFrame parseado (lote atual) os campos mais úteis para pré-preencher o form.
+    """
+    if df_itens is None or df_itens.empty:
+        return {"unidade_consumidora": uc}
+
+    sub = df_itens[df_itens["unidade_consumidora"].astype(str) == str(uc)]
+    if sub.empty:
+        return {"unidade_consumidora": uc}
+
+    row = sub.iloc[0].to_dict()
+    return {
+        "unidade_consumidora": row.get("unidade_consumidora"),
+        "cliente_numero": row.get("cliente_numero"),
+        "nome": row.get("nome"),
+        "cnpj_cpf": row.get("cnpj") or row.get("cnpj_cpf"),
+        "cep": row.get("cep"),
+        "cidade_uf": row.get("cidade_uf"),
+        "grupo_subgrupo_tensao": row.get("grupo_subgrupo_tensao"),
+        "classe_modalidade": row.get("classe_modalidade"),
+    }
+
+
+def form_cadastro_cliente(header_prefill: Dict[str, Any]) -> bool:
+    """
+    Formulário Streamlit para cadastrar/validar cliente em info_clientes.
+    Retorna True quando salvou.
+    """
+    uc = str(header_prefill.get("unidade_consumidora") or "").strip()
+
+    # inferências
+    classe_modalidade = header_prefill.get("classe_modalidade")
+    n_fases_guess = infer_n_fases(classe_modalidade) or 3
+    custo_guess = infer_custo_disp(n_fases_guess) or 100
+
+    with st.form(key=f"form_cliente_{uc}"):
+        st.subheader(f"Cadastro do cliente (UC: {uc})")
+
+        unidade_consumidora = st.text_input("Unidade Consumidora (UC)", value=uc)
+        cliente_numero = st.text_input("Cliente (número)", value=str(header_prefill.get("cliente_numero") or ""))
+        nome = st.text_input("Nome", value=str(header_prefill.get("nome") or ""))
+        cnpj_cpf = st.text_input("CPF/CNPJ", value=str(header_prefill.get("cnpj_cpf") or ""))
+        cep = st.text_input("CEP", value=str(header_prefill.get("cep") or ""))
+        cidade_uf = st.text_input("Cidade/UF", value=str(header_prefill.get("cidade_uf") or ""))
+
+        grupo_subgrupo_tensao = st.text_input(
+            "Grupo/Subgrupo Tensão",
+            value=str(header_prefill.get("grupo_subgrupo_tensao") or "")
+        )
+
+        classe_modalidade_in = st.text_input(
+            "Classificação / Modalidade Tarifária / Tipo de Fornecimento",
+            value=str(classe_modalidade or "")
+        )
+
+        # n_fases e custo_disp
+        n_fases = st.selectbox("n_fases (1/2/3)", options=[1, 2, 3], index=[1,2,3].index(n_fases_guess))
+        custo_disp = st.number_input("custo_disp (kWh)", min_value=0, step=1, value=int(infer_custo_disp(n_fases) or custo_guess))
+
+        # Atribuídos pelo usuário
+        desconto_contratado = st.number_input("desconto_contratado (R$)", value=float(0.0), step=1.0)
+        subvencao = st.number_input("subvencao (R$)", value=float(0.0), step=1.0)
+        status = st.selectbox("status", options=["ATIVO", "INATIVO", "PENDENTE"], index=0)
+
+        salvar = st.form_submit_button("Salvar cliente")
+
+    if not salvar:
+        return False
+
+    # monta DF para upsert
+    df_cliente = pd.DataFrame([{
+        "unidade_consumidora": unidade_consumidora,
+        "cliente_numero": cliente_numero,
+        "nome": nome,
+        "cnpj_cpf": cnpj_cpf,
+        "cep": cep,
+        "cidade_uf": cidade_uf,
+        "grupo_subgrupo_tensao": grupo_subgrupo_tensao,
+        "classe_modalidade": classe_modalidade_in,
+        "n_fases": int(n_fases),
+        "custo_disp": int(custo_disp),
+        "desconto_contratado": float(desconto_contratado),
+        "subvencao": float(subvencao),
+        "status": status,
+    }])
+
+    # IMPORTANTE: a chave da dimensão deve ser UC (ajuste se sua tabela usar outra)
+    upsert_dataframe(df_cliente, TABLE_CLIENTES, key_column="unidade_consumidora")
+    st.success(f"Cliente UC {unidade_consumidora} salvo em info_clientes.")
+    return True
