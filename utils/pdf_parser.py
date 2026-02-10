@@ -1,7 +1,9 @@
 """
 ERB Tech - Parser de Faturas CELESC
-VERSÃO v2 - Inclui parse de "Classificação / Modalidade Tarifária / Tipo de Fornecimento"
-e salva em df_itens['classe_modalidade'] (igual ao grupo_subgrupo_tensao).
+VERSÃO v3 - Parser robusto para:
+- Classe/Modalidade/Tipo mesmo sem rótulo e com truncamento (ex.: TRIFÁSIC)
+- Unidade Consumidora (UC) sem ambiguidades
+- Itens sem unidade (ex.: COSIP)
 """
 
 import re
@@ -77,7 +79,6 @@ LABELS = {
     'grupo': 'Grupo/Subgrupo Tensão:',
     'cliente': 'Cliente:',
     'unidade_consumidora': 'Unidade Consumidora',
-    # Em muitos PDFs esse texto aparece “quebrado”; por isso usamos regex flexível (ver parse_classe_modalidade)
     'classe_modalidade': 'Classificação / Modalidade Tarifária / Tipo de Fornecimento',
 }
 
@@ -88,6 +89,56 @@ def extract_between(text, start_label, end_labels, flags=re.S):
     end_alt = '|'.join(re.escape(lbl) for lbl in end_labels)
     pat = re.escape(start_label) + r'\s*(.*?)\s*(?=(?:' + end_alt + r'))'
     return safe_search(pat, text, flags=flags)
+
+
+def _normalize_fases_truncadas(s: str) -> str:
+    """
+    Em muitos PDFs o extract_text() vem truncado no final:
+    TRIFÁSIC / BIFÁSIC / MONOFÁSIC (sem 'O').
+    Aqui normalizamos.
+    """
+    if not s:
+        return s
+    s = clean_spaces(s) or s
+
+    # cobre variações com/sem acento e truncamento
+    s = re.sub(r'(TRIF[ÁA]?SIC)(?!O)', r'\1O', s, flags=re.I)
+    s = re.sub(r'(BIF[ÁA]?SIC)(?!O)', r'\1O', s, flags=re.I)
+    s = re.sub(r'(MONOF[ÁA]?SIC)(?!O)', r'\1O', s, flags=re.I)
+    return s
+
+
+def parse_unidade_consumidora(txt: str) -> Optional[str]:
+    """
+    Extrai UC de forma determinística:
+    1) Pelo rótulo "Unidade Consumidora" (mesma linha ou linha seguinte)
+    2) Pelo bloco inicial antes de "Cliente:" buscando linha só com dígitos (8-12)
+    3) Fallback bem controlado
+    """
+    # 1) label-based
+    m = re.search(r'Unidade\s+Consumidora\s*\n?\s*0*([0-9]{8,12})', txt, flags=re.I)
+    if m:
+        return (m.group(1).lstrip('0') or m.group(1))
+
+    # 2) bloco inicial (antes de "Cliente:")
+    lines = txt.splitlines()
+    stop = min(len(lines), 40)
+    for i, l in enumerate(lines[:stop]):
+        if re.search(r'\bCliente\s*:', l, flags=re.I):
+            stop = i
+            break
+
+    for l in lines[:stop]:
+        lm = re.match(r'^\s*0*([0-9]{8,12})\s*$', l)
+        if lm:
+            return (lm.group(1).lstrip('0') or lm.group(1))
+
+    # 3) fallback: 8-12 dígitos não seguido por / (evita CNPJ)
+    m = re.search(r'(?<!\d)0*([0-9]{8,12})(?![\d/])', txt)
+    if m:
+        return (m.group(1).lstrip('0') or m.group(1))
+
+    return None
 
 
 def parse_periodo_leituras(txt: str) -> dict:
@@ -118,6 +169,7 @@ def parse_periodo_leituras(txt: str) -> dict:
         out.update({'leitura_anterior': la, 'leitura_atual': lt, 'dias': di, 'proxima_leitura': pl})
         return out
 
+    # fallback: linha compacta "dd/mm/aaaa dd/mm/aaaa N dd/mm/aaaa"
     raw_pat = r'([0-9]{2}/[0-9]{2}/[0-9]{4})\s+([0-9]{2}/[0-9]{2}/[0-9]{4})\s+([0-9]{1,3})\s+([0-9]{2}/[0-9]{2}/[0-9]{4})'
     m = re.search(raw_pat, txt, flags=re.I)
     if m:
@@ -132,27 +184,44 @@ def parse_periodo_leituras(txt: str) -> dict:
 
 def parse_classe_modalidade(txt: str) -> Optional[str]:
     """
-    Tenta capturar o valor do campo:
-    "Classificação / Modalidade Tarifária / Tipo de Fornecimento"
-
+    Captura o valor do campo "Classificação / Modalidade Tarifária / Tipo de Fornecimento".
+    Nesta fatura padrão, o extract_text() traz o valor sem o rótulo e ainda truncado.
     Estratégia:
-    1) Regex pelo rótulo (tolerante a espaços, barras e quebras de linha)
-    2) Fallback: primeira linha que contenha MONOFÁSICO/BIFÁSICO/TRIFÁSICO (modo antigo)
+    1) Regex pelo rótulo (quando existir no texto)
+    2) Scan do bloco inicial (antes de Cliente:) pegando a primeira linha com MONO/BI/TRI
+    3) Normaliza truncamentos (TRIFÁSIC -> TRIFÁSICO)
     """
-    # 1) Busca pelo rótulo (muito comum estar quebrado em várias “colunas” no texto extraído)
+    # 1) pelo rótulo (quando existir no texto extraído)
     pat = (
         r'Classifica(?:ç|c)ão\s*/\s*Modalidade\s*Tarif[aá]ria\s*/\s*Tipo\s*de\s*Fornecimento'
         r'\s*[:\-]?\s*(?:\n\s*)?([^\n]+)'
     )
     v = safe_search(pat, txt, flags=re.I)
     v = clean_spaces(v)
+    if v:
+        return _normalize_fases_truncadas(v) or None
 
-    # 2) Fallback antigo
-    if not v:
-        v = safe_search(r'^(.*?(?:MONOF[ÁA]SICO|BIF[ÁA]SICO|TRIF[ÁA]SICO).*)$', txt, flags=re.M | re.I)
-        v = clean_spaces(v)
+    # 2) scan do bloco inicial antes de "Cliente:"
+    lines = [clean_spaces(l) for l in txt.splitlines()]
+    lines = [l for l in lines if l]
 
-    return v or None
+    stop = min(len(lines), 50)
+    for i, l in enumerate(lines[:stop]):
+        if re.search(r'\bCliente\s*:', l, flags=re.I):
+            stop = i
+            break
+
+    phase_pat = re.compile(r'\b(MONOF|BIF|TRIF|MONO|BI|TRI)\b', re.I)
+    for l in lines[:stop]:
+        if l.strip().startswith('('):  # evita itens
+            continue
+        if phase_pat.search(l):
+            return _normalize_fases_truncadas(l)
+
+    # 3) fallback final (bem permissivo)
+    v = safe_search(r'^(.*?(?:MONO|BI|TRI).*)$', txt, flags=re.M | re.I)
+    v = clean_spaces(v)
+    return _normalize_fases_truncadas(v) if v else None
 
 
 def infer_n_fases(classe_modalidade: Optional[str]) -> Optional[int]:
@@ -160,7 +229,7 @@ def infer_n_fases(classe_modalidade: Optional[str]) -> Optional[int]:
         return None
     s = clean_spaces(classe_modalidade).upper()
 
-    # tolerância a variações
+    # tolerante (pega TRIFÁSIC/TRIFASIC/TRIFÁSICO)
     if "TRIF" in s:
         return 3
     if "BIF" in s:
@@ -173,54 +242,103 @@ def infer_n_fases(classe_modalidade: Optional[str]) -> Optional[int]:
 def parse_header(txt: str) -> dict:
     h = {}
 
-    # Campo novo: classificação/modalidade/tipo
+    # classificação/modalidade/tipo
     h['classe_modalidade'] = parse_classe_modalidade(txt)
     h['n_fases_parseado'] = infer_n_fases(h.get('classe_modalidade'))
 
-    h['unidade_consumidora'] = safe_search(rf'{LABELS["unidade_consumidora"]}\s*\n\s*0*([0-9]+)', txt) \
-        or safe_search(r'\b0*([0-9]{8,})\b', txt)
-    h['cliente_numero'] = safe_search(rf'{re.escape(LABELS["cliente"])}\s*([0-9]+)', txt)
+    # UC e cliente
+    h['unidade_consumidora'] = parse_unidade_consumidora(txt)
+    h['cliente_numero'] = safe_search(r'\bCliente\s*:\s*([0-9]+)', txt, flags=re.I)
 
+    # referência / vencimento / total a pagar
     m = re.search(r'(\d{2}/\d{4})\s+(\d{2}/\d{2}/\d{4})\s+R\$?\s*([0-9\.,]+)', txt)
     if m:
         h['referencia'] = m.group(1)
         h['vencimento'] = m.group(2)
         h['total_pagar'] = br2float(m.group(3))
 
+    # dados do cliente
     nome = extract_between(txt, LABELS['nome'], LABELS['cpfcnpj']) or safe_search(r'NOME:\s*(.+)', txt)
     h['nome'] = clean_spaces(nome)
     h['cnpj_cpf'] = safe_search(rf'{re.escape(LABELS["cpfcnpj"])}\s*([^\n]+)', txt)
     ender = extract_between(txt, LABELS['endereco'], LABELS['cep'])
     h['endereco'] = clean_spaces(ender)
     h['cep'] = safe_search(rf'{re.escape(LABELS["cep"])}\s*([0-9\-]+)', txt)
+
+    # cidade/UF pode vir junto na mesma linha
     cid_uf = safe_search(rf'{re.escape(LABELS["cidade"])}\s*([A-ZÇÃÂÉÊÍÓÔÕÚÜ\s]+[A-Z]{{2}})', txt)
     h['cidade_uf'] = clean_spaces(cid_uf)
-    h['grupo_subgrupo_tensao'] = safe_search(rf'{re.escape(LABELS["grupo"])}([^\n]+)', txt)
+
+    # grupo/subgrupo tensão (às vezes sem espaço após ":")
+    h['grupo_subgrupo_tensao'] = safe_search(r'Grupo/Subgrupo\s*Tens[aã]o:\s*([^\n]+)', txt, flags=re.I)
 
     return h
 
 
 def parse_nf(txt: str) -> dict:
-    m = re.search(r'NOTA FISCAL Nº\s*([0-9]+)\s+SERIE:([0-9]+)\s+DATA EMISSAO:\s*([0-9/]+)', txt, re.I)
+    # tolerante a EMISSAO/EMISSÃO
+    m = re.search(r'NOTA\s+FISCAL\s+N[ºO]\s*([0-9]+)\s+SERIE:?\s*([0-9]+)\s+DATA\s+EMISS(?:A|Ã)O:\s*([0-9/]+)', txt, re.I)
     return {'numero': m.group(1), 'serie': m.group(2), 'data_emissao': m.group(3)} if m else {}
 
 
 def parse_itens(txt: str) -> list:
+    """
+    Suporta linhas com unidade (KWH/...) e sem unidade (ex.: COSIP).
+    Formato típico:
+      (0D) Consumo TE KWH 2.175,000 0,409876 891,48 ...
+      (C0) COSIP Municipal 0,000 0,000000 89,11 ...
+    """
     itens = []
+    allowed_units = {"KWH", "MWH", "KVARH", "KVAH", "UN"}
+
     for raw in txt.splitlines():
-        line = raw.strip()
+        line = clean_spaces(raw) or ""
         if not line.startswith('('):
             continue
-        m = re.match(r'^\((\w{1,2})\)\s*(.+?)\s+(KWH|MWH|KVARH|KVAH|UN)\s+(.+)$', line, flags=re.I)
-        if not m:
+
+        m0 = re.match(r'^\((\w{1,2})\)\s*(.*)$', line, flags=re.I)
+        if not m0:
             continue
-        code, desc, unit, tail = m.groups()
-        nums = [br2float(x) for x in tail.split()]
-        item = {'codigo': code, 'descricao': desc.strip(), 'unidade': unit.upper()}
+
+        code = (m0.group(1) or "").upper()
+        rest = (m0.group(2) or "").strip()
+        if not rest:
+            continue
+
+        # tenta achar unidade no meio da string
+        unit = None
+        desc = None
+        tail = None
+
+        # procura qualquer unidade como token
+        mu = re.search(r'\b(KWH|MWH|KVARH|KVAH|UN)\b', rest, flags=re.I)
+        if mu:
+            unit = mu.group(1).upper()
+            desc = rest[:mu.start()].strip()
+            tail = rest[mu.end():].strip()
+        else:
+            # sem unidade: desc até o primeiro número
+            mn = re.search(r'[-+]?\d[\d\.,]*', rest)
+            if not mn:
+                continue
+            unit = "UN"
+            desc = rest[:mn.start()].strip()
+            tail = rest[mn.start():].strip()
+
+        if not desc or not tail:
+            continue
+
+        # tokens numéricos do tail
+        toks = tail.split()
+        nums = [br2float(x) for x in toks]
+
+        item = {'codigo': code, 'descricao': desc, 'unidade': unit}
         cols = ['quantidade', 'tarifa', 'valor', 'pis_valor', 'cofins_base', 'icms_aliquota', 'icms_valor', 'tarifa_sem_trib']
         for i, v in enumerate(nums):
             item[cols[i] if i < len(cols) else f'valor_extra_{i-len(cols)+1}'] = v
+
         itens.append(item)
+
     return itens
 
 
@@ -230,26 +348,31 @@ def parse_medidores(txt: str) -> list:
 
     medidores = []
     for raw in txt.splitlines():
-        line = raw.strip()
+        line = clean_spaces(raw) or ""
         if 'Energia' not in line or not any(is_unico(t) for t in line.split()):
             continue
+
         parts = line.split()
         if not parts or not re.fullmatch(r'\d+', parts[0] or ''):
             continue
+
         try:
             unico_idx = next(i for i, p in enumerate(parts) if is_unico(p))
         except StopIteration:
             continue
+
         tipo = ' '.join(parts[1:unico_idx]).strip() or 'Energia'
         start = unico_idx + 1
         if len(parts) < start + 5:
             continue
+
         ant, atu, const, fator, tot = parts[start:start+5]
         medidores.append({
             'medidor': parts[0], 'tipo': tipo, 'posto': 'Único',
             'leitura_anterior': br2float(ant), 'leitura_atual': br2float(atu),
             'constante': br2float(const), 'fator': br2float(fator), 'total_apurado': br2float(tot),
         })
+
     return medidores
 
 
@@ -303,7 +426,7 @@ def parse_fatura(pdf_path: str) -> ResultadoParsing:
             if c in df_itens.columns:
                 df_itens[c] = pd.to_numeric(df_itens[c], errors='coerce')
 
-        # Campos comuns - IGUAL AO NOTEBOOK
+        # Campos comuns
         df_itens['unidade_consumidora'] = header.get('unidade_consumidora')
         df_itens['cliente_numero'] = header.get('cliente_numero')
         df_itens['referencia'] = header.get('referencia')
@@ -315,13 +438,16 @@ def parse_fatura(pdf_path: str) -> ResultadoParsing:
         df_itens['cidade_uf'] = header.get('cidade_uf')
         df_itens['grupo_subgrupo_tensao'] = header.get('grupo_subgrupo_tensao')
 
-        # NOVO: salvar a classificação/modalidade/tipo em fatura_itens
+        # NOVO: classificação/modalidade/tipo
         df_itens['classe_modalidade'] = header.get('classe_modalidade')
 
+        # período leituras
         df_itens['leitura_anterior'] = as_text_or_none(periodo.get('leitura_anterior'))
         df_itens['leitura_atual'] = as_text_or_none(periodo.get('leitura_atual'))
         df_itens['dias'] = periodo.get('dias')
         df_itens['proxima_leitura'] = as_text_or_none(periodo.get('proxima_leitura'))
+
+        # NF
         df_itens['numero'] = nf.get('numero')
         df_itens['serie'] = nf.get('serie')
         df_itens['data_emissao'] = as_text_or_none(nf.get('data_emissao'))
@@ -335,7 +461,7 @@ def parse_fatura(pdf_path: str) -> ResultadoParsing:
         if 'dias' in df_itens.columns:
             df_itens['dias'] = pd.to_numeric(df_itens['dias'], errors='coerce').astype('Int64')
 
-        # Remover colunas extras (valor_extra_*)
+        # Remove colunas extras valor_extra_*
         df_itens = df_itens[[c for c in df_itens.columns if not c.startswith('valor_extra')]]
 
     # DataFrame de medidores
