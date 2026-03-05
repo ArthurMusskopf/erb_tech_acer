@@ -1,11 +1,12 @@
 """
-ERB Tech - Tela 1: Upload, Revisão e Emissão de Boleto por Fatura (NF)
-Fluxo:
-1) Upload e parseamento
-2) Revisão (editar itens/medidores/cabeçalho)
-3) Validar -> calcular boleto (comparar com Excel)
-4) (Opcional) Substituir fatura no BigQuery com os dados revisados
-5) Gerar boleto no Sicoob Sandbox
+ERB Tech - Tela 1: Upload + Revisão + Cálculo em lote com bloqueios (info_clientes manual)
+
+v2 (objetivo demo):
+- Upload/parsing e gravação BigQuery (igual)
+- Diagnóstico do lote: NFs calculáveis vs bloqueadas por cadastro
+- Cadastro manual (dimensão info_clientes) com n_fases e custo_disp INTEGER
+- Cálculo por NF e cálculo em lote (somente calculáveis)
+- Salva cálculo no BigQuery em boletos_calculados usando schema (id/nota_fiscal/valor_final...)
 """
 
 from __future__ import annotations
@@ -18,7 +19,7 @@ import tempfile
 import hashlib
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, Any, Tuple, Optional
+from typing import Dict, Any, Tuple, Optional, List
 
 import pandas as pd
 import streamlit as st
@@ -27,7 +28,8 @@ from google.cloud import bigquery
 sys.path.append(str(Path(__file__).parent.parent))
 
 from utils.pdf_parser import processar_lote_faturas, make_item_id
-from utils.calc_engine import calculate_boletos
+from utils.calc_engine import calculate_boletos, infer_n_fases, compute_custo_disp
+from utils.boletos_adapter import calc_to_boletos_schema
 from utils.sicoob_client import (
     get_sicoob_config_from_secrets,
     SicoobCobrancaV3Client,
@@ -43,25 +45,23 @@ from utils.bigquery_client import (
     TABLE_BOLETOS,
 )
 
+APP_VERSION = "upload_v2_lote_cadastro"
 
 st.set_page_config(page_title="Upload de Faturas - ERB Tech", page_icon="📄", layout="wide")
-st.title("📄 Upload, Revisão e Emissão de Boleto (por Fatura)")
-
+st.title("📄 Upload, Revisão e Cálculo (por Lote)")
+st.caption(f"versão: {APP_VERSION}")
 
 # -----------------------------------------------------------------------------
 # Session state
 # -----------------------------------------------------------------------------
 if "faturas_processadas" not in st.session_state:
     st.session_state.faturas_processadas = None
-
 if "calc_por_nf" not in st.session_state:
-    st.session_state.calc_por_nf = {}  # nf -> df_calculo
-
+    st.session_state.calc_por_nf = {}
 if "edited_itens" not in st.session_state:
-    st.session_state.edited_itens = {}  # nf -> df_itens
-
+    st.session_state.edited_itens = {}
 if "edited_med" not in st.session_state:
-    st.session_state.edited_med = {}  # nf -> df_medidores
+    st.session_state.edited_med = {}
 
 
 # -----------------------------------------------------------------------------
@@ -79,10 +79,6 @@ def _to_iso_date(v: str) -> str:
 
 
 def _recompute_ids_for_invoice(df_itens: pd.DataFrame, df_med: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Recalcula IDs para evitar inconsistências após edição.
-    OBS: como vamos deletar a NF antes de salvar, não há risco de duplicar.
-    """
     it = df_itens.copy()
     if "id" in it.columns:
         it["id"] = it.apply(
@@ -113,7 +109,8 @@ def _delete_nf_from_bigquery(nf: str) -> None:
     )
     client.query(f"DELETE FROM `{TABLE_FATURA_ITENS}` WHERE numero = @nf", job_config=cfg).result()
     client.query(f"DELETE FROM `{TABLE_MEDIDORES}` WHERE nota_fiscal_numero = @nf", job_config=cfg).result()
-    client.query(f"DELETE FROM `{TABLE_BOLETOS}` WHERE numero = @nf", job_config=cfg).result()
+    # boletos_calculados usa id/nota_fiscal
+    client.query(f"DELETE FROM `{TABLE_BOLETOS}` WHERE id = @nf OR nota_fiscal = @nf", job_config=cfg).result()
 
 
 def _load_cliente(uc: str) -> pd.DataFrame:
@@ -121,21 +118,45 @@ def _load_cliente(uc: str) -> pd.DataFrame:
     return execute_query(q, {"uc": str(uc)})
 
 
-def _save_cliente(payload: Dict[str, Any]) -> None:
-    df = pd.DataFrame([payload])
-    upsert_dataframe(df, TABLE_CLIENTES, key_column="unidade_consumidora")
+def _load_clientes_for_ucs(ucs: List[str]) -> pd.DataFrame:
+    if not ucs:
+        return pd.DataFrame()
+    q = f"""
+    SELECT unidade_consumidora, desconto_contratado, subvencao, status, n_fases, custo_disp
+    FROM `{TABLE_CLIENTES}`
+    WHERE unidade_consumidora IN UNNEST(@ucs)
+    """
+    return execute_query(q, {"ucs": ucs})
+
+
+def _cadastro_motivo(cli_row: Optional[pd.Series]) -> Optional[str]:
+    if cli_row is None:
+        return "UC não cadastrada"
+    if pd.isna(cli_row.get("desconto_contratado")):
+        return "desconto_contratado vazio"
+    if pd.isna(cli_row.get("custo_disp")):
+        return "custo_disp vazio"
+    stt = str(cli_row.get("status") or "").strip().lower()
+    if not stt:
+        return "status vazio"
+    if stt != "ativo":
+        return f"status '{cli_row.get('status')}'"
+    return None
 
 
 def _calc_boleto_from_dfs(df_itens_nf: pd.DataFrame, df_med_nf: pd.DataFrame) -> Tuple[pd.DataFrame, Optional[str]]:
     if df_itens_nf is None or df_itens_nf.empty:
         return pd.DataFrame(), "Sem itens para calcular."
-    uc = str(df_itens_nf["unidade_consumidora"].dropna().iloc[0]) if "unidade_consumidora" in df_itens_nf.columns else ""
+
+    uc = str(df_itens_nf["unidade_consumidora"].dropna().iloc[0]) if "unidade_consumidora" in df_itens_nf.columns and df_itens_nf["unidade_consumidora"].notna().any() else ""
     if not uc:
         return pd.DataFrame(), "UC ausente nos itens."
 
     df_cli = _load_cliente(uc)
-    if df_cli is None or df_cli.empty:
-        return pd.DataFrame(), f"UC {uc} não cadastrada em info_clientes."
+    cli_row = df_cli.iloc[0] if df_cli is not None and not df_cli.empty else None
+    motivo = _cadastro_motivo(cli_row)
+    if motivo is not None:
+        return pd.DataFrame(), f"Cadastro insuficiente (info_clientes): {motivo}"
 
     res = calculate_boletos(
         df_itens=df_itens_nf,
@@ -145,14 +166,16 @@ def _calc_boleto_from_dfs(df_itens_nf: pd.DataFrame, df_med_nf: pd.DataFrame) ->
         only_status_ativo=True,
     )
     if res.df_boletos is None or res.df_boletos.empty:
-        return pd.DataFrame(), "Cálculo retornou vazio."
+        if res.missing_clientes:
+            return pd.DataFrame(), f"Cálculo filtrou UC(s): {res.missing_clientes} | {res.missing_reason}"
+        return pd.DataFrame(), "Cálculo retornou vazio (investigar parse/medidores/itens)."
     return res.df_boletos, None
 
 
 # -----------------------------------------------------------------------------
 # UI
 # -----------------------------------------------------------------------------
-tab_upload, tab_revisao, tab_historico = st.tabs(["📤 Upload", "📝 Revisão + Boleto", "📜 Histórico"])
+tab_upload, tab_revisao, tab_historico = st.tabs(["📤 Upload", "🧮 Revisão + Lote", "📜 Histórico"])
 
 # =========================
 # TAB UPLOAD
@@ -242,283 +265,233 @@ with tab_upload:
 
 
 # =========================
-# TAB REVISÃO + BOLETO
+# TAB REVISÃO + LOTE
 # =========================
 with tab_revisao:
-    st.markdown("### Revisar dados e gerar boleto (1 fatura por vez)")
+    st.markdown("### Revisar, cadastrar e calcular (lote do upload)")
 
     if st.session_state.faturas_processadas is None:
         st.info("📤 Faça o upload de faturas na aba anterior.")
+        st.stop()
+
+    resultado = st.session_state.faturas_processadas
+    df_itens_all = resultado["df_itens"].copy()
+    df_med_all = resultado["df_medidores"].copy() if resultado["df_medidores"] is not None else pd.DataFrame()
+
+    nfs = sorted(df_itens_all["numero"].dropna().astype(str).unique().tolist())
+    if not nfs:
+        st.warning("Não encontramos NFs no lote parseado.")
+        st.stop()
+
+    # Diagnóstico topo: bloqueadas x calculáveis
+    ucs = sorted(df_itens_all["unidade_consumidora"].dropna().astype(str).unique().tolist()) if "unidade_consumidora" in df_itens_all.columns else []
+    df_cli_all = _load_clientes_for_ucs(ucs)
+
+    diag_rows = []
+    for nf in nfs:
+        df_it_nf_tmp = df_itens_all[df_itens_all["numero"].astype(str) == str(nf)]
+        uc_tmp = str(df_it_nf_tmp["unidade_consumidora"].dropna().iloc[0]) if "unidade_consumidora" in df_it_nf_tmp.columns and df_it_nf_tmp["unidade_consumidora"].notna().any() else ""
+        hit = df_cli_all[df_cli_all["unidade_consumidora"].astype(str) == uc_tmp] if (df_cli_all is not None and not df_cli_all.empty and uc_tmp) else pd.DataFrame()
+        cli_row = hit.iloc[0] if not hit.empty else None
+        motivo = _cadastro_motivo(cli_row)
+        diag_rows.append({"numero": str(nf), "unidade_consumidora": uc_tmp, "calculavel": motivo is None, "motivo": "" if motivo is None else motivo})
+
+    df_diag = pd.DataFrame(diag_rows)
+    bloqueadas = df_diag[~df_diag["calculavel"]]
+    ok = df_diag[df_diag["calculavel"]]
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("NFs no lote", len(df_diag))
+    c2.metric("Calculáveis", len(ok))
+    c3.metric("Bloqueadas (cadastro)", len(bloqueadas))
+
+    if not bloqueadas.empty:
+        st.warning("⚠️ Existem NFs bloqueadas por cadastro em info_clientes (manual).")
+        with st.expander("Ver NFs bloqueadas"):
+            st.dataframe(bloqueadas, hide_index=True, width="stretch")
     else:
-        resultado = st.session_state.faturas_processadas
-        df_itens_all = resultado["df_itens"].copy()
-        df_med_all = resultado["df_medidores"].copy() if resultado["df_medidores"] is not None else pd.DataFrame()
+        st.success("✅ Todas as NFs do lote têm cadastro mínimo para cálculo.")
 
-        nfs = sorted(df_itens_all["numero"].dropna().astype(str).unique().tolist())
-        if not nfs:
-            st.warning("Não encontramos NFs no lote parseado.")
+    st.markdown("---")
+
+    # Botão lote
+    calc_lote = st.button("🧮 Calcular todas as NFs calculáveis do lote", type="primary", width="stretch", disabled=(len(ok) == 0))
+    if calc_lote:
+        falhas = []
+        for nf in ok["numero"].tolist():
+            df_it_nf = df_itens_all[df_itens_all["numero"].astype(str) == str(nf)].copy()
+            df_med_nf = df_med_all[df_med_all["nota_fiscal_numero"].astype(str) == str(nf)].copy() if not df_med_all.empty else pd.DataFrame()
+
+            df_calc, err = _calc_boleto_from_dfs(df_it_nf, df_med_nf)
+            if err:
+                falhas.append({"numero": nf, "erro": err})
+            else:
+                st.session_state.calc_por_nf[str(nf)] = df_calc.copy()
+
+        if falhas:
+            st.warning(f"⚠️ {len(falhas)} NF(s) falharam no cálculo do lote.")
+            st.dataframe(pd.DataFrame(falhas), hide_index=True, width="stretch")
+        st.success(f"✅ Lote calculado. Resultados disponíveis em 'NF selecionada' abaixo.")
+
+    st.markdown("---")
+
+    # Seleção NF (para revisão/cadastro/cálculo/salvar)
+    nf_sel = st.selectbox("Selecione a NF para conferência", options=nfs)
+
+    df_it_nf = df_itens_all[df_itens_all["numero"].astype(str) == str(nf_sel)].copy()
+    df_med_nf = df_med_all[df_med_all["nota_fiscal_numero"].astype(str) == str(nf_sel)].copy() if not df_med_all.empty else pd.DataFrame()
+
+    if nf_sel in st.session_state.edited_itens:
+        df_it_nf = st.session_state.edited_itens[nf_sel].copy()
+    if nf_sel in st.session_state.edited_med:
+        df_med_nf = st.session_state.edited_med[nf_sel].copy()
+
+    uc_now = str(df_it_nf["unidade_consumidora"].dropna().iloc[0]) if "unidade_consumidora" in df_it_nf.columns and df_it_nf["unidade_consumidora"].notna().any() else ""
+
+    st.markdown(f"## 👤 Cadastro manual (info_clientes) — UC **{uc_now}**")
+    df_cli_one = _load_cliente(uc_now) if uc_now else pd.DataFrame()
+    cli_row = df_cli_one.iloc[0] if df_cli_one is not None and not df_cli_one.empty else None
+
+    classe_mod = str(df_it_nf["classe_modalidade"].dropna().iloc[0]) if "classe_modalidade" in df_it_nf.columns and df_it_nf["classe_modalidade"].notna().any() else ""
+    n_sug = infer_n_fases(classe_mod) or 3
+    custo_sug = int(compute_custo_disp(n_sug) or 100)
+
+    desconto_cur = float(pd.to_numeric(cli_row.get("desconto_contratado"), errors="coerce") or 0.15) if cli_row is not None else 0.15
+    subv_cur = float(pd.to_numeric(cli_row.get("subvencao"), errors="coerce") or 0.0) if cli_row is not None else 0.0
+    status_cur = str(cli_row.get("status") or "Ativo") if cli_row is not None else "Ativo"
+    n_cur = int(pd.to_numeric(cli_row.get("n_fases"), errors="coerce") or n_sug) if cli_row is not None else n_sug
+    custo_cur = int(pd.to_numeric(cli_row.get("custo_disp"), errors="coerce") or custo_sug) if cli_row is not None else custo_sug
+
+    motivo = _cadastro_motivo(cli_row)
+    if motivo is None:
+        st.success("✅ Cadastro mínimo OK para cálculo.")
+    else:
+        st.error(f"Cadastro insuficiente: **{motivo}**")
+
+    with st.form(f"form_cli_{uc_now}"):
+        c1, c2, c3, c4, c5 = st.columns([1, 1, 1, 1, 1])
+        with c1:
+            desconto = st.number_input("desconto_contratado", min_value=0.0, max_value=1.0, value=float(desconto_cur), step=0.01)
+        with c2:
+            subvencao = st.number_input("subvencao", min_value=0.0, value=float(subv_cur), step=50.0)
+        with c3:
+            n_fases = st.selectbox("n_fases", options=[1, 2, 3], index=[1, 2, 3].index(int(n_cur)))
+        with c4:
+            custo_disp = st.number_input("custo_disp (INTEGER kWh)", min_value=0, value=int(custo_cur), step=10)
+        with c5:
+            status = st.selectbox("status", options=["Ativo", "Inativo"], index=0 if str(status_cur).lower() == "ativo" else 1)
+
+        salvar_cli = st.form_submit_button("💾 Salvar/Atualizar info_clientes")
+
+    if salvar_cli:
+        try:
+            payload = {
+                "unidade_consumidora": uc_now,
+                "desconto_contratado": float(desconto),
+                "subvencao": float(subvencao),
+                "n_fases": int(n_fases),
+                "custo_disp": int(custo_disp),  # ✅ INTEGER
+                "status": str(status),
+                "updated_at": datetime.utcnow(),
+            }
+            upsert_dataframe(pd.DataFrame([payload]), TABLE_CLIENTES, key_column="unidade_consumidora")
+            st.success("✅ Cadastro salvo. Agora você pode calcular.")
+        except Exception as e:
+            st.error(f"Falha ao salvar info_clientes: {e}")
+
+    st.markdown("---")
+
+    # Revisão itens/medidores (mantém editável como você já tinha)
+    st.markdown("## ✏️ Itens tarifários (editável)")
+    editable_cols = [c for c in ["codigo", "descricao", "unidade", "quantidade_registrada", "tarifa", "valor"] if c in df_it_nf.columns]
+    fixed_cols = [c for c in df_it_nf.columns if c not in editable_cols]
+
+    df_it_edit = st.data_editor(
+        df_it_nf,
+        disabled=fixed_cols,
+        hide_index=True,
+        width="stretch",
+        key=f"edit_it_{nf_sel}",
+    )
+
+    st.markdown("## ✏️ Medidores (editável)")
+    df_med_edit = df_med_nf
+    if df_med_nf is None or df_med_nf.empty:
+        st.info("Sem tabela de medidores para esta NF.")
+    else:
+        editable_med_cols = [c for c in ["medidor", "tipo", "posto", "total_apurado"] if c in df_med_nf.columns]
+        fixed_med_cols = [c for c in df_med_nf.columns if c not in editable_med_cols]
+        df_med_edit = st.data_editor(
+            df_med_nf,
+            disabled=fixed_med_cols,
+            hide_index=True,
+            width="stretch",
+            key=f"edit_med_{nf_sel}",
+        )
+
+    st.session_state.edited_itens[nf_sel] = df_it_edit.copy()
+    st.session_state.edited_med[nf_sel] = (df_med_edit.copy() if df_med_edit is not None else pd.DataFrame())
+
+    st.markdown("---")
+
+    # Botões cálculo/salvar
+    cA, cB, cC = st.columns([1, 1, 1])
+    calc_btn = cA.button("🧮 Calcular esta NF", type="primary", width="stretch")
+    save_calc_btn = cB.button("💾 Salvar cálculo no BigQuery", width="stretch")
+    save_rev_btn = cC.button("💾 Substituir fatura no BigQuery (revisada)", width="stretch")
+
+    if save_rev_btn:
+        try:
+            with st.spinner("Substituindo NF no BigQuery (DELETE + INSERT)..."):
+                it_reid, med_reid = _recompute_ids_for_invoice(df_it_edit, df_med_edit)
+                _delete_nf_from_bigquery(str(nf_sel))
+                n_it = upsert_dataframe(it_reid, TABLE_FATURA_ITENS, "id")
+                n_med = upsert_dataframe(med_reid, TABLE_MEDIDORES, "id") if med_reid is not None and not med_reid.empty else 0
+            st.success(f"✅ NF {nf_sel} substituída no BigQuery: {n_it} itens, {n_med} medidores.")
+        except Exception as e:
+            st.error(f"Falha ao substituir no BigQuery: {e}")
+
+    if calc_btn:
+        df_calc, err = _calc_boleto_from_dfs(df_it_edit, df_med_edit)
+        if err:
+            st.error(err)
         else:
-            nf_sel = st.selectbox("Selecione a Nota Fiscal (NF) para revisão", options=nfs)
+            st.session_state.calc_por_nf[str(nf_sel)] = df_calc.copy()
+            st.success("✅ Cálculo concluído.")
 
-            df_it_nf = df_itens_all[df_itens_all["numero"].astype(str) == str(nf_sel)].copy()
-            df_med_nf = df_med_all[df_med_all["nota_fiscal_numero"].astype(str) == str(nf_sel)].copy() if not df_med_all.empty else pd.DataFrame()
+    df_calc_show = st.session_state.calc_por_nf.get(str(nf_sel))
+    if df_calc_show is not None and not df_calc_show.empty:
+        row = df_calc_show.iloc[0].to_dict()
+        st.markdown("## ✅ Resultado do cálculo (resumo)")
+        st.write(f"**Valor total boleto:** R$ {float(pd.to_numeric(row.get('valor_total_boleto'), errors='coerce') or 0.0):,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
+        st.write(f"**Base kWh (med_inj_tusd):** {float(pd.to_numeric(row.get('med_inj_tusd'), errors='coerce') or 0.0):,.0f}".replace(",", "X").replace(".", ",").replace("X", "."))
+        st.write(f"**Check:** {row.get('check')}")
 
-            if nf_sel in st.session_state.edited_itens:
-                df_it_nf = st.session_state.edited_itens[nf_sel].copy()
-            if nf_sel in st.session_state.edited_med:
-                df_med_nf = st.session_state.edited_med[nf_sel].copy()
+        with st.expander("Ver memorial completo (tabela)"):
+            st.dataframe(df_calc_show, hide_index=True, width="stretch")
 
-            st.markdown("#### 🧾 Cabeçalho")
-            uc0 = str(df_it_nf["unidade_consumidora"].dropna().iloc[0]) if "unidade_consumidora" in df_it_nf.columns and not df_it_nf.empty else ""
-            nome0 = str(df_it_nf["nome"].dropna().iloc[0]) if "nome" in df_it_nf.columns and not df_it_nf.empty else ""
-            ref0 = str(df_it_nf["referencia"].dropna().iloc[0]) if "referencia" in df_it_nf.columns and not df_it_nf.empty else ""
-            venc0 = str(df_it_nf["vencimento"].dropna().iloc[0]) if "vencimento" in df_it_nf.columns and not df_it_nf.empty else ""
-            tot0 = float(pd.to_numeric(df_it_nf["total_pagar"], errors="coerce").dropna().iloc[0]) if "total_pagar" in df_it_nf.columns and pd.to_numeric(df_it_nf["total_pagar"], errors="coerce").notna().any() else 0.0
+        buf = io.BytesIO()
+        df_calc_show.to_excel(buf, index=False)
+        buf.seek(0)
+        st.download_button(
+            "⬇️ Exportar memorial (Excel)",
+            data=buf,
+            file_name=f"memorial_nf_{nf_sel}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            width="stretch",
+        )
 
-            with st.form(f"header_{nf_sel}"):
-                c1, c2, c3, c4 = st.columns(4)
-                with c1:
-                    uc = st.text_input("Unidade Consumidora (UC)", value=uc0)
-                with c2:
-                    nome = st.text_input("Nome", value=nome0)
-                with c3:
-                    referencia = st.text_input("Referência (MM/AAAA)", value=ref0)
-                with c4:
-                    vencimento = st.text_input("Vencimento (DD/MM/AAAA)", value=venc0)
-
-                total_pagar = st.number_input("Total a pagar (R$)", min_value=0.0, value=float(tot0), step=10.0)
-
-                apply_header = st.form_submit_button("Aplicar alterações no cabeçalho")
-                if apply_header:
-                    for col, val in [
-                        ("unidade_consumidora", uc),
-                        ("nome", nome),
-                        ("referencia", referencia),
-                        ("vencimento", vencimento),
-                        ("total_pagar", total_pagar),
-                    ]:
-                        if col in df_it_nf.columns:
-                            df_it_nf[col] = val
-                        if not df_med_nf.empty and col in df_med_nf.columns:
-                            df_med_nf[col] = val
-
-                    st.success("Cabeçalho aplicado.")
-                    st.session_state.edited_itens[nf_sel] = df_it_nf.copy()
-                    st.session_state.edited_med[nf_sel] = df_med_nf.copy()
-                    st.rerun()
-
-            st.markdown("---")
-
-            st.markdown("#### ✏️ Itens tarifários (editável)")
-            editable_cols = [c for c in ["codigo", "descricao", "unidade", "quantidade_registrada", "tarifa", "valor"] if c in df_it_nf.columns]
-            fixed_cols = [c for c in df_it_nf.columns if c not in editable_cols]
-
-            col_cfg = {}
-            if "quantidade_registrada" in df_it_nf.columns:
-                col_cfg["quantidade_registrada"] = st.column_config.NumberColumn("Quantidade (kWh)", format="%.3f")
-            if "tarifa" in df_it_nf.columns:
-                col_cfg["tarifa"] = st.column_config.NumberColumn("Tarifa", format="%.8f")
-            if "valor" in df_it_nf.columns:
-                col_cfg["valor"] = st.column_config.NumberColumn("Valor (R$)", format="%.2f")
-
-            df_it_edit = st.data_editor(
-                df_it_nf,
-                disabled=fixed_cols,
-                column_config=col_cfg,
-                hide_index=True,
-                width="stretch",
-                key=f"edit_itens_{nf_sel}",
-            )
-
-            st.markdown("#### ✏️ Medidores (editável)")
-            if df_med_nf is None or df_med_nf.empty:
-                st.info("Sem tabela de medidores para esta NF.")
-                df_med_edit = df_med_nf
-            else:
-                editable_med_cols = [c for c in ["medidor", "tipo", "posto", "total_apurado"] if c in df_med_nf.columns]
-                fixed_med_cols = [c for c in df_med_nf.columns if c not in editable_med_cols]
-                med_cfg = {}
-                if "total_apurado" in df_med_nf.columns:
-                    med_cfg["total_apurado"] = st.column_config.NumberColumn("Total apurado", format="%.3f")
-
-                df_med_edit = st.data_editor(
-                    df_med_nf,
-                    disabled=fixed_med_cols,
-                    column_config=med_cfg,
-                    hide_index=True,
-                    width="stretch",
-                    key=f"edit_med_{nf_sel}",
-                )
-
-            st.session_state.edited_itens[nf_sel] = df_it_edit.copy()
-            st.session_state.edited_med[nf_sel] = (df_med_edit.copy() if df_med_edit is not None else pd.DataFrame())
-
-            st.markdown("---")
-
-            st.markdown("#### 👤 Cadastro do associado (info_clientes)")
-            uc_now = str(df_it_edit["unidade_consumidora"].dropna().iloc[0]) if "unidade_consumidora" in df_it_edit.columns and not df_it_edit.empty else ""
-            df_cli = _load_cliente(uc_now) if uc_now else pd.DataFrame()
-            if df_cli is None or df_cli.empty:
-                st.warning(f"UC **{uc_now}** ainda não cadastrada em **info_clientes**. Cadastre para calcular boleto.")
-                with st.form(f"cad_{uc_now}"):
-                    c1, c2, c3, c4 = st.columns(4)
-                    with c1:
-                        desconto = st.number_input("Desconto contratado", min_value=0.0, max_value=1.0, value=0.15, step=0.01)
-                    with c2:
-                        subv = st.number_input("Subvenção", min_value=0.0, value=0.0, step=50.0)
-                    with c3:
-                        custo_disp = st.number_input("Custo de disponibilidade", min_value=0.0, value=100.0, step=10.0)
-                    with c4:
-                        status = st.selectbox("Status", ["Ativo", "Inativo"], index=0)
-
-                    salvar = st.form_submit_button("Salvar cadastro")
-                    if salvar:
-                        _save_cliente({
-                            "unidade_consumidora": uc_now,
-                            "desconto_contratado": float(desconto),
-                            "subvencao": float(subv),
-                            "custo_disp": float(custo_disp),
-                            "status": str(status),
-                        })
-                        st.success("✅ Cadastro salvo. Agora você pode calcular.")
-                        st.rerun()
-            else:
-                st.success(f"✅ UC encontrada: {uc_now} (status: {df_cli.iloc[0].get('status')})")
-                st.dataframe(df_cli, hide_index=True, width="stretch")
-
-            st.markdown("---")
-
-            cA, cB, cC, cD = st.columns([1, 1, 1, 1])
-            with cA:
-                calc_btn = st.button("🧮 Calcular boleto (dados revisados)", type="primary", width="stretch")
-            with cB:
-                save_rev_btn = st.button("💾 Substituir fatura no BigQuery (revisada)", width="stretch")
-            with cC:
-                save_calc_btn = st.button("💾 Salvar cálculo no BigQuery", width="stretch")
-            with cD:
-                emit_btn = st.button("🏦 Emitir boleto Sicoob + PDF", width="stretch")
-
-            if calc_btn:
-                with st.spinner("Calculando (fiel ao Excel)..."):
-                    df_calc, err = _calc_boleto_from_dfs(df_it_edit, df_med_edit)
-                if err:
-                    st.error(err)
-                else:
-                    st.session_state.calc_por_nf[nf_sel] = df_calc.copy()
-                    st.success("✅ Cálculo concluído. Confira abaixo.")
-
-            df_calc_show = st.session_state.calc_por_nf.get(nf_sel)
-            if df_calc_show is not None and not df_calc_show.empty:
-                st.markdown("### 🧮 Resultado do cálculo (memorial)")
-                st.dataframe(df_calc_show, hide_index=True, width="stretch")
-
-                row = df_calc_show.iloc[0].to_dict()
-                valor_calc = float(pd.to_numeric(row.get("valor_total_boleto"), errors="coerce") or 0.0)
-                med_kwh = float(pd.to_numeric(row.get("med_inj_tusd"), errors="coerce") or 0.0)
-
-                st.markdown("#### 🔍 Comparação (opcional) com Excel")
-                with st.expander("Abrir comparação"):
-                    exp_val = st.number_input("Valor total boleto esperado (Excel)", value=float(valor_calc), step=10.0)
-                    exp_med = st.number_input("Med. Inj. TUSD esperado (Excel)", value=float(med_kwh), step=1.0)
-                    st.write(f"Δ Valor (calc - excel): **{(valor_calc - exp_val):,.2f}**".replace(",", "X").replace(".", ",").replace("X", "."))
-                    st.write(f"Δ kWh (calc - excel): **{(med_kwh - exp_med):,.3f}**".replace(",", "X").replace(".", ",").replace("X", "."))
-
-                buf = io.BytesIO()
-                df_calc_show.to_excel(buf, index=False)
-                buf.seek(0)
-                st.download_button(
-                    "⬇️ Exportar memorial (Excel)",
-                    data=buf,
-                    file_name=f"memorial_nf_{nf_sel}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    width="stretch",
-                )
-
-            if save_rev_btn:
-                try:
-                    with st.spinner("Substituindo NF no BigQuery (DELETE + INSERT)..."):
-                        it_reid, med_reid = _recompute_ids_for_invoice(df_it_edit, df_med_edit)
-                        _delete_nf_from_bigquery(str(nf_sel))
-                        n_it = upsert_dataframe(it_reid, TABLE_FATURA_ITENS, "id")
-                        n_med = upsert_dataframe(med_reid, TABLE_MEDIDORES, "id") if med_reid is not None and not med_reid.empty else 0
-                    st.success(f"✅ NF {nf_sel} substituída no BigQuery: {n_it} itens, {n_med} medidores.")
-                except Exception as e:
-                    st.error(f"Falha ao substituir no BigQuery: {e}")
-
-            if save_calc_btn:
-                df_calc_save = st.session_state.calc_por_nf.get(nf_sel)
-                if df_calc_save is None or df_calc_save.empty:
-                    st.warning("Calcule primeiro.")
-                else:
-                    try:
-                        with st.spinner("Salvando cálculo em boletos_calculados..."):
-                            upsert_dataframe(df_calc_save, TABLE_BOLETOS, key_column="numero")
-                        st.success("✅ Cálculo salvo.")
-                    except Exception as e:
-                        st.error(f"Falha ao salvar cálculo: {e}")
-
-            if emit_btn:
-                df_calc_emit = st.session_state.calc_por_nf.get(nf_sel)
-                if df_calc_emit is None or df_calc_emit.empty:
-                    st.warning("Calcule primeiro.")
-                else:
-                    row = df_calc_emit.iloc[0].to_dict()
-                    valor = float(pd.to_numeric(row.get("valor_total_boleto"), errors="coerce") or 0.0)
-                    if valor <= 0:
-                        st.info("Valor <= 0 indica gerador/remuneração. Emissão de boleto (cobrança) não se aplica.")
-                    else:
-                        try:
-                            cfg = get_sicoob_config_from_secrets()
-                            sicoob = SicoobCobrancaV3Client(cfg)
-
-                            venc_raw = str(row.get("vencimento") or "")
-                            venc_iso = _to_iso_date(venc_raw)
-                            hoje_iso = datetime.utcnow().strftime("%Y-%m-%d")
-
-                            nosso_numero_default = int(str(nf_sel)[:8]) if str(nf_sel).isdigit() else 0
-                            nosso_numero = st.number_input(
-                                "Nosso número (sandbox)",
-                                min_value=0,
-                                value=int(nosso_numero_default),
-                                step=1,
-                                key=f"nn_emit_{nf_sel}",
-                            )
-
-                            payload = build_boleto_payload_from_row(
-                                row,
-                                cfg=cfg,
-                                nosso_numero=int(nosso_numero),
-                                data_emissao=hoje_iso,
-                                data_vencimento=venc_iso,
-                                valor=round(valor, 2),
-                            )
-
-                            with st.spinner("Criando boleto no Sicoob (sandbox)..."):
-                                resp_create = sicoob.create_boleto(payload)
-
-                            nosso_ret = (resp_create.get("resultado", {}) or {}).get("nossoNumero") or int(nosso_numero)
-                            st.success(f"✅ Boleto criado. NossoNúmero: {nosso_ret}")
-
-                            with st.spinner("Baixando PDF (2ª via)..."):
-                                resp_pdf = sicoob.segunda_via_pdf(nosso_numero=nosso_ret, gerar_pdf=True)
-                                pdf_bytes = sicoob.decode_pdf_boleto(resp_pdf)
-
-                            st.download_button(
-                                "⬇️ Download PDF do Boleto",
-                                data=pdf_bytes,
-                                file_name=f"boleto_nf_{nf_sel}.pdf",
-                                mime="application/pdf",
-                                width="stretch",
-                            )
-
-                            res2 = resp_pdf.get("resultado", {}) if isinstance(resp_pdf, dict) else {}
-                            if res2.get("linhaDigitavel"):
-                                st.code(res2["linhaDigitavel"])
-                            if res2.get("qrCode"):
-                                st.text_area("QR Code (copia/cola)", value=res2["qrCode"], height=120)
-
-                        except Exception as e:
-                            st.error(f"Falha na emissão/2ª via: {e}")
+    if save_calc_btn:
+        df_calc_save = st.session_state.calc_por_nf.get(str(nf_sel))
+        if df_calc_save is None or df_calc_save.empty:
+            st.warning("Calcule primeiro.")
+        else:
+            try:
+                df_bq = calc_to_boletos_schema(df_calc_save, df_it_edit, status="calculado")
+                upsert_dataframe(df_bq, TABLE_BOLETOS, key_column="id")
+                st.success("✅ Cálculo salvo em boletos_calculados.")
+            except Exception as e:
+                st.error(f"Falha ao salvar cálculo: {e}")
 
 
 # =========================
