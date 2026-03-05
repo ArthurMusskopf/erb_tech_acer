@@ -1,12 +1,19 @@
 """
-ERB Tech - Tela 2: Boletos (cálculo fiel + emissão Sicoob Sandbox)
+ERB Tech - Tela 2: Boletos (por Fatura)
+Objetivo:
+- Selecionar uma NF já registrada no BigQuery
+- Calcular o boleto (fiel ao Excel) e exibir memorial
+- (Opcional) Salvar cálculo em boletos_calculados
+- Emitir boleto no Sicoob Sandbox e baixar PDF
 """
 
-import base64
+from __future__ import annotations
+
+import io
+import re
 from datetime import datetime, timedelta
 from pathlib import Path
 import sys
-import io
 
 import pandas as pd
 import streamlit as st
@@ -16,7 +23,6 @@ sys.path.append(str(Path(__file__).parent.parent))
 from utils.bigquery_client import (
     execute_query,
     upsert_dataframe,
-    get_periodos_disponiveis,
     TABLE_FATURA_ITENS,
     TABLE_MEDIDORES,
     TABLE_CLIENTES,
@@ -31,272 +37,173 @@ from utils.sicoob_client import (
 )
 
 st.set_page_config(page_title="Boletos - ERB Tech", page_icon="💰", layout="wide")
-st.title("💰 Boletos de Cobrança (ACER)")
+st.title("💰 Boletos (por Fatura / NF)")
 
 
 @st.cache_data(ttl=60, show_spinner=False)
-def load_boletos_calculados(periodo: str) -> pd.DataFrame:
+def load_nf_list(limit: int = 200) -> pd.DataFrame:
     q = f"""
-    SELECT *
-    FROM `{TABLE_BOLETOS}`
-    WHERE periodo = @p
-    ORDER BY nome
+    SELECT
+      numero,
+      referencia,
+      unidade_consumidora,
+      ANY_VALUE(nome) AS nome,
+      ANY_VALUE(vencimento) AS vencimento,
+      ANY_VALUE(total_pagar) AS total_pagar
+    FROM `{TABLE_FATURA_ITENS}`
+    WHERE numero IS NOT NULL
+    GROUP BY numero, referencia, unidade_consumidora
+    ORDER BY referencia DESC, numero DESC
+    LIMIT {int(limit)}
     """
-    return execute_query(q, {"p": periodo})
+    return execute_query(q)
 
 
-def recalc_and_persist(periodo: str) -> pd.DataFrame:
-    with st.spinner("Carregando dados do BigQuery e recalculando..."):
-        df_itens = execute_query(f"SELECT * FROM `{TABLE_FATURA_ITENS}` WHERE referencia = @p", {"p": periodo})
-        df_med = execute_query(f"SELECT * FROM `{TABLE_MEDIDORES}` WHERE referencia = @p", {"p": periodo})
-
-        # clientes usados no período (somente UCs que aparecem)
-        ucs = []
-        if df_itens is not None and not df_itens.empty and "unidade_consumidora" in df_itens.columns:
-            ucs = df_itens["unidade_consumidora"].dropna().astype(str).unique().tolist()
-
-        if ucs:
-            df_cli = execute_query(
-                f"SELECT * FROM `{TABLE_CLIENTES}` WHERE unidade_consumidora IN UNNEST(@ucs)",
-                {"ucs": ucs},
-            )
-        else:
-            df_cli = pd.DataFrame()
-
-        res = calculate_boletos(
-            df_itens=df_itens,
-            df_medidores=df_med,
-            df_clientes=df_cli,
-            only_registered_clients=True,
-            only_status_ativo=True,
-        )
-
-        if res.missing_clientes:
-            st.warning(f"Existem {len(res.missing_clientes)} UC(s) sem cadastro ativo. Cadastre abaixo e recalcule.")
-            st.session_state["missing_clientes_boletos"] = res.missing_clientes
-            st.session_state["missing_reason_boletos"] = res.missing_reason
-
-        df_out = res.df_boletos.copy()
-        if df_out is None or df_out.empty:
-            st.warning("Cálculo retornou vazio.")
-            return pd.DataFrame()
-
-        upsert_dataframe(df_out, TABLE_BOLETOS, key_column="numero")
-        st.success(f"✅ Gravado em {TABLE_BOLETOS}: {len(df_out)} linhas.")
-        return df_out
+@st.cache_data(ttl=60, show_spinner=False)
+def load_invoice_data(nf: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    q1 = f"SELECT * FROM `{TABLE_FATURA_ITENS}` WHERE numero = @nf"
+    q2 = f"SELECT * FROM `{TABLE_MEDIDORES}` WHERE nota_fiscal_numero = @nf"
+    return execute_query(q1, {"nf": str(nf)}), execute_query(q2, {"nf": str(nf)})
 
 
-def render_cadastro_clientes(missing: list[str]) -> None:
-    st.markdown("### 🧾 Cadastro rápido de UCs pendentes")
-
-    with st.expander("Abrir formulário de cadastro", expanded=True):
-        for uc in missing:
-            with st.form(f"form_uc_{uc}"):
-                st.markdown(f"#### UC **{uc}**")
-                col1, col2, col3, col4 = st.columns(4)
-                with col1:
-                    desconto = st.number_input("Desconto contratado", min_value=0.0, max_value=1.0, value=0.15, step=0.01)
-                with col2:
-                    subv = st.number_input("Subvenção", min_value=0.0, value=0.0, step=50.0)
-                with col3:
-                    custo_disp = st.number_input("Custo disponibilidade", min_value=0.0, value=100.0, step=10.0)
-                with col4:
-                    status = st.selectbox("Status", ["Ativo", "Inativo"], index=0)
-
-                nome = st.text_input("Nome (opcional)", value="")
-                cnpj = st.text_input("CNPJ/CPF (opcional)", value="")
-                cep = st.text_input("CEP (opcional)", value="")
-                cidade_uf = st.text_input("Cidade/UF (opcional)", value="")
-
-                ok = st.form_submit_button("Salvar UC")
-                if ok:
-                    df = pd.DataFrame([{
-                        "unidade_consumidora": str(uc),
-                        "desconto_contratado": float(desconto),
-                        "subvencao": float(subv),
-                        "custo_disp": float(custo_disp),
-                        "status": str(status),
-                        "nome": nome,
-                        "cnpj": cnpj,
-                        "cep": cep,
-                        "cidade_uf": cidade_uf,
-                    }])
-                    upsert_dataframe(df, TABLE_CLIENTES, key_column="unidade_consumidora")
-                    st.success("✅ UC cadastrada/atualizada.")
+@st.cache_data(ttl=60, show_spinner=False)
+def load_cliente(uc: str) -> pd.DataFrame:
+    q = f"SELECT * FROM `{TABLE_CLIENTES}` WHERE unidade_consumidora = @uc LIMIT 1"
+    return execute_query(q, {"uc": str(uc)})
 
 
-# ---------------- UI topo ----------------
-colA, colB, colC, colD = st.columns([2, 1, 1, 1])
+def _to_iso_date(v: str) -> str:
+    v = str(v or "").strip()
+    try:
+        return datetime.strptime(v, "%d/%m/%Y").strftime("%Y-%m-%d")
+    except Exception:
+        try:
+            return datetime.strptime(v, "%Y-%m-%d").strftime("%Y-%m-%d")
+        except Exception:
+            return (datetime.utcnow() + timedelta(days=5)).strftime("%Y-%m-%d")
 
-with colA:
-    periodos = get_periodos_disponiveis()
-    periodo = st.selectbox("Período de referência", options=periodos if periodos else ["(sem dados)"])
-with colB:
-    st.markdown("<br>", unsafe_allow_html=True)
-    btn_load = st.button("📥 Carregar", use_container_width=True, disabled=(periodo == "(sem dados)"))
-with colC:
-    st.markdown("<br>", unsafe_allow_html=True)
-    btn_recalc = st.button("🧮 Recalcular e gravar", use_container_width=True, disabled=(periodo == "(sem dados)"))
-with colD:
-    st.markdown("<br>", unsafe_allow_html=True)
-    filtro = st.selectbox("Filtro", ["Cobrança (valor>0)", "Geradores (valor<0)", "Todos"], index=0)
 
-st.markdown("---")
-
-# cadastro pendências (se existirem)
-missing = st.session_state.get("missing_clientes_boletos", [])
-if missing:
-    render_cadastro_clientes(missing)
-
-# carregamento
-dfb = pd.DataFrame()
-if btn_recalc and periodo != "(sem dados)":
-    dfb = recalc_and_persist(periodo)
-elif btn_load and periodo != "(sem dados)":
-    with st.spinner("Carregando boletos calculados..."):
-        dfb = load_boletos_calculados(periodo)
-
-if dfb is None or dfb.empty:
-    st.info("Carregue um período ou recalcule para gerar a base de boletos.")
+df_nfs = load_nf_list()
+if df_nfs is None or df_nfs.empty:
+    st.warning("Nenhuma NF encontrada em BigQuery. Faça upload na Tela 1.")
     st.stop()
 
-# filtros
-dfb["valor_total_boleto_num"] = pd.to_numeric(dfb["valor_total_boleto"], errors="coerce").fillna(0.0)
+df_nfs = df_nfs.copy()
+df_nfs["label"] = df_nfs.apply(
+    lambda r: f"{r['referencia']} | NF {r['numero']} | UC {r['unidade_consumidora']} | {str(r.get('nome') or '')[:40]}",
+    axis=1,
+)
 
-if filtro == "Cobrança (valor>0)":
-    df_show = dfb[dfb["valor_total_boleto_num"] > 0].copy()
-elif filtro == "Geradores (valor<0)":
-    df_show = dfb[dfb["valor_total_boleto_num"] < 0].copy()
-else:
-    df_show = dfb.copy()
+nf_label = st.selectbox("Selecione a NF", options=df_nfs["label"].tolist())
+nf_sel = str(df_nfs.loc[df_nfs["label"] == nf_label, "numero"].iloc[0])
 
-# resumo
-col1, col2, col3, col4 = st.columns(4)
-col1.metric("Linhas", len(df_show))
-col2.metric("Cobranças (qtd)", int((df_show["valor_total_boleto_num"] > 0).sum()))
-col3.metric("Total cobranças (R$)", f"{df_show.loc[df_show['valor_total_boleto_num']>0,'valor_total_boleto_num'].sum():,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
-col4.metric("Total geradores (R$)", f"{df_show.loc[df_show['valor_total_boleto_num']<0,'valor_total_boleto_num'].sum():,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
+c1, c2, c3 = st.columns([1, 1, 1])
+calc_btn = c1.button("🧮 Calcular", type="primary", width="stretch")
+save_btn = c2.button("💾 Salvar cálculo", width="stretch")
+emit_btn = c3.button("🏦 Emitir + PDF", width="stretch")
 
 st.markdown("---")
 
-# Sicoob client
-try:
-    sicoob_cfg = get_sicoob_config_from_secrets()
-    sicoob = SicoobCobrancaV3Client(sicoob_cfg)
-    sicoob_ok = True
-except Exception as e:
-    sicoob_ok = False
-    st.warning(f"Sicoob não configurado em secrets.toml: {e}")
+if "calc_nf" not in st.session_state:
+    st.session_state.calc_nf = {}
 
-st.markdown(f"### 📋 Boletos — {periodo}")
+if calc_btn:
+    df_it, df_med = load_invoice_data(nf_sel)
+    if df_it is None or df_it.empty:
+        st.error("NF sem itens.")
+    else:
+        uc = str(df_it["unidade_consumidora"].dropna().iloc[0]) if "unidade_consumidora" in df_it.columns else ""
+        df_cli = load_cliente(uc) if uc else pd.DataFrame()
+        if df_cli is None or df_cli.empty:
+            st.error(f"UC {uc} não cadastrada em info_clientes. Cadastre na Tela 1.")
+        else:
+            with st.spinner("Calculando (fiel ao Excel)..."):
+                res = calculate_boletos(df_itens=df_it, df_medidores=df_med, df_clientes=df_cli)
+            st.session_state.calc_nf[nf_sel] = res.df_boletos.copy()
+            st.success("✅ Cálculo concluído.")
 
-for i, r in df_show.sort_values("nome").iterrows():
-    nome = str(r.get("nome") or "")[:60]
-    uc = str(r.get("unidade_consumidora") or "")
-    nf = str(r.get("numero") or "")
-    valor = float(r.get("valor_total_boleto_num") or 0.0)
+df_calc = st.session_state.calc_nf.get(nf_sel)
+if df_calc is None or df_calc.empty:
+    st.info("Clique em **Calcular** para ver o memorial.")
+    st.stop()
 
-    tag = "🟢 COBRANÇA" if valor > 0 else ("🟣 GERADOR" if valor < 0 else "⚪ 0")
-    with st.expander(f"{tag} | {nome} | UC {uc} | NF {nf} | R$ {valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")):
+st.markdown("### 🧮 Memorial")
+st.dataframe(df_calc, hide_index=True, width="stretch")
 
-        colL, colR = st.columns([2, 1])
+row = df_calc.iloc[0].to_dict()
+valor = float(pd.to_numeric(row.get("valor_total_boleto"), errors="coerce") or 0.0)
 
-        with colL:
-            st.markdown("#### 🧾 Memorial (cálculo)")
-            cols_show = [
-                "medidores_apurado", "custo_disp", "injetada", "med_inj_tusd",
-                "tarifa_cheia_trib2", "tarifa_cheia", "tarifa_paga_conc",
-                "tarifa_erb", "tarifa_bol",
-                "valor_band_amar_desc", "valor_band_vrm_desc",
-                "tarifa_total_boleto", "valor_total_boleto",
-                "check", "gerador", "boleto",
-            ]
-            mem = {c: r.get(c) for c in cols_show if c in df_show.columns}
-            st.dataframe(pd.DataFrame([mem]).T.rename(columns={0: "valor"}), use_container_width=True)
-
-        with colR:
-            st.markdown("#### 👤 Dados p/ boleto")
-            st.write(f"**Vencimento (fatura):** {r.get('vencimento')}")
-            st.write(f"**CNPJ/CPF:** {r.get('cnpj_cpf')}")
-            st.write(f"**CEP:** {r.get('cep')}")
-            st.write(f"**Cidade/UF:** {r.get('cidade_uf')}")
-
-            st.markdown("#### 🏦 Sicoob (Sandbox)")
-            if valor <= 0:
-                st.info("Para valor < 0 (geradores), isso é remuneração. Fluxo de pagamento fica para a próxima fase.")
-            else:
-                if not sicoob_ok:
-                    st.error("Sicoob não configurado.")
-                else:
-                    # vencimento: tenta converter "DD/MM/YYYY" -> YYYY-MM-DD; senão usa hoje+5
-                    venc_raw = str(r.get("vencimento") or "")
-                    venc_iso = None
-                    try:
-                        # casos comuns do parser
-                        dt = datetime.strptime(venc_raw, "%d/%m/%Y")
-                        venc_iso = dt.strftime("%Y-%m-%d")
-                    except Exception:
-                        venc_iso = (datetime.utcnow() + timedelta(days=5)).strftime("%Y-%m-%d")
-
-                    hoje_iso = datetime.utcnow().strftime("%Y-%m-%d")
-
-                    nosso_numero = st.number_input(
-                        "Nosso número (sandbox)",
-                        min_value=0,
-                        value=int(re.sub(r"\D+", "", nf)[:8] or "0"),
-                        step=1,
-                        key=f"nn_{nf}",
-                    )
-
-                    if st.button("🚀 Emitir boleto + baixar PDF", key=f"emit_{nf}", use_container_width=True):
-                        try:
-                            payload = build_boleto_payload_from_row(
-                                r.to_dict(),
-                                cfg=sicoob_cfg,
-                                nosso_numero=int(nosso_numero),
-                                data_emissao=hoje_iso,
-                                data_vencimento=venc_iso,
-                                valor=round(float(valor), 2),
-                            )
-                            resp_create = sicoob.create_boleto(payload)
-
-                            # tenta extrair nossoNumero retornado; se não vier, usa o enviado
-                            nosso_ret = (
-                                resp_create.get("resultado", {}).get("nossoNumero")
-                                if isinstance(resp_create, dict) else None
-                            ) or int(nosso_numero)
-
-                            st.success(f"✅ Boleto criado. NossoNúmero: {nosso_ret}")
-
-                            resp_pdf = sicoob.segunda_via_pdf(nosso_numero=nosso_ret, gerar_pdf=True)
-                            pdf_bytes = sicoob.decode_pdf_boleto(resp_pdf)
-
-                            st.download_button(
-                                "⬇️ Download PDF do Boleto",
-                                data=pdf_bytes,
-                                file_name=f"boleto_{nf}.pdf",
-                                mime="application/pdf",
-                                use_container_width=True,
-                            )
-
-                            # mostra linha digitável/qrCode se vierem
-                            res2 = resp_pdf.get("resultado", {})
-                            if res2.get("linhaDigitavel"):
-                                st.code(res2["linhaDigitavel"])
-                            if res2.get("qrCode"):
-                                st.text_area("QR Code (copia/cola)", value=res2["qrCode"], height=120)
-
-                        except Exception as e:
-                            st.error(f"Falha ao emitir/baixar boleto: {e}")
-
-st.markdown("---")
-st.markdown("### 📦 Exportação")
 buf = io.BytesIO()
-df_show.drop(columns=["valor_total_boleto_num"], errors="ignore").to_excel(buf, index=False)
+df_calc.to_excel(buf, index=False)
 buf.seek(0)
 st.download_button(
-    "⬇️ Exportar Excel (boletos do filtro)",
+    "⬇️ Exportar memorial (Excel)",
     data=buf,
-    file_name=f"boletos_{periodo.replace('/','_')}.xlsx",
+    file_name=f"memorial_nf_{nf_sel}.xlsx",
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    width="stretch",
 )
+
+if save_btn:
+    try:
+        with st.spinner("Salvando em boletos_calculados..."):
+            upsert_dataframe(df_calc, TABLE_BOLETOS, key_column="numero")
+        st.success("✅ Salvo.")
+    except Exception as e:
+        st.error(f"Erro ao salvar: {e}")
+
+if emit_btn:
+    if valor <= 0:
+        st.info("Valor <= 0 indica gerador/remuneração. Emissão de boleto não se aplica.")
+    else:
+        try:
+            cfg = get_sicoob_config_from_secrets()
+            sicoob = SicoobCobrancaV3Client(cfg)
+
+            venc_iso = _to_iso_date(str(row.get("vencimento") or ""))
+            hoje_iso = datetime.utcnow().strftime("%Y-%m-%d")
+
+            nosso_numero_default = int(re.sub(r"\D+", "", str(nf_sel))[:8] or "0")
+            nosso_numero = st.number_input(
+                "Nosso número (sandbox)",
+                min_value=0,
+                value=int(nosso_numero_default),
+                step=1,
+                key=f"nn_{nf_sel}",
+            )
+
+            payload = build_boleto_payload_from_row(
+                row,
+                cfg=cfg,
+                nosso_numero=int(nosso_numero),
+                data_emissao=hoje_iso,
+                data_vencimento=venc_iso,
+                valor=round(float(valor), 2),
+            )
+
+            with st.spinner("Criando boleto no Sicoob (sandbox)..."):
+                resp_create = sicoob.create_boleto(payload)
+
+            nosso_ret = (resp_create.get("resultado", {}) or {}).get("nossoNumero") or int(nosso_numero)
+            st.success(f"✅ Boleto criado. NossoNúmero: {nosso_ret}")
+
+            with st.spinner("Baixando PDF (2ª via)..."):
+                resp_pdf = sicoob.segunda_via_pdf(nosso_numero=nosso_ret, gerar_pdf=True)
+                pdf_bytes = sicoob.decode_pdf_boleto(resp_pdf)
+
+            st.download_button(
+                "⬇️ Download PDF do Boleto",
+                data=pdf_bytes,
+                file_name=f"boleto_nf_{nf_sel}.pdf",
+                mime="application/pdf",
+                width="stretch",
+            )
+
+            res2 = resp_pdf.get("resultado", {}) if isinstance(resp_pdf, dict) else {}
+            if res2.get("linhaDigitavel"):
+                st.code(res2["linhaDigitavel"])
+            if res2.get("qrCode"):
+                st.text_area("QR Code (copia/cola)", value=res2["qrCode"], height=120)
+
+        except Exception as e:
+            st.error(f"Falha na emissão/2ª via: {e}")
