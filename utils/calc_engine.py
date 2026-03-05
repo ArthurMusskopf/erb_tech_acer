@@ -1,6 +1,6 @@
-# calc_engine.py
+# utils/calc_engine.py
 # =============================================================================
-# ERB Tech - Calculation Engine
+# ERB Tech - Calculation Engine (FIEL AO EXCEL)
 # Replica as fórmulas do Excel (Formulario_ERB_TechArt.xlsx -> Calculos_Boleto -> tabela "Calculo")
 # =============================================================================
 
@@ -15,46 +15,6 @@ import unicodedata
 
 import numpy as np
 import pandas as pd
-
-
-# =============================================================================
-# Fórmulas extraídas (referência fiel do Excel)
-# =============================================================================
-
-FORMULAS_EXCEL_CALCULO: Dict[str, str] = {
-    "custo_disp": "_xlfn.XLOOKUP(Calculo[[#This Row],[unidade_consumidora]],Tabela1[unidade_consumidora],Tabela1[custo_disp])",
-    "medidores_apurado": 'SUMIFS(medidores_leituras_1[total_apurado],medidores_leituras_1[nota_fiscal_numero],Calculo[[#This Row],[numero]],medidores_leituras_1[tipo],"Energia")-SUMIFS(medidores_leituras_1[total_apurado],medidores_leituras_1[nota_fiscal_numero],Calculo[[#This Row],[numero]],medidores_leituras_1[tipo],"Energia injetada")',
-    "injetada": "Calculo[[#This Row],[medidores_apurado]]-Calculo[[#This Row],[custo_disp]]",
-    "boleto": "IF(Calculo[[#This Row],[medidores_apurado]]-Calculo[[#This Row],[custo_disp]]<=0,0,1)",
-    "desconto_contratado": "_xlfn.XLOOKUP(uc,info_clientes[unidade_consumidora],info_clientes[desconto_contratado])",
-    "tarifa_cheia_trib": 'IF(boleto=1,SUMIFS(fatura_itens[tarifa],numero,numero,descricao,"Consumo TE")+SUMIFS(...,"Consumo TUSD"),0)',
-    "check": 'IF(tarifa_cheia_trib>10,"Parseamento",IF(tarifa_cheia_trib>1,"Subvenção","Certo"))',
-    "subvencao": "_xlfn.XLOOKUP(uc,info_clientes[unidade_consumidora],info_clientes[subvencao])",
-    "tarifa_cheia_trib2": 'IF(AND(check<>"Certo",boleto=1),SUMIFS(tarifa,"Consumo TE",quantidade_registrada,"<>"&subvencao)+SUMIFS(...,"Consumo TUSD"...),tarifa_cheia_trib)',
-    "gerador": 'IF(_xlfn.XLOOKUP(numero,medidores[nota_fiscal_numero],medidores[tipo],"")="Energia injetada",1,0)',
-    "med_inj_tusd": 'boleto*(SUMIFS(qtd,descricao,"Energia Inj. TUSD")-SUMIFS(medidores,total_apurado,tipo,"Energia Injetada"))',
-    "Energia Inj. TUSD": "IF(AND(boleto=1,gerador=0,med_inj_tusd<>0),[média ponderada MAXIFS/MINIFS],XLOOKUP(med_inj_tusd&'Energia Inj. TUSD', qtd&desc, tarifa,0))",
-    "Energia Injet. TE": "IF(AND(boleto=1,gerador=0,med_inj_tusd<>0),[média ponderada MAXIFS/MINIFS],XLOOKUP(med_inj_tusd&'Energia Injet. TE', qtd&desc, tarifa,0))",
-    "tarifa_cheia_trib3": "IF(Energia Inj. TUSD + Energia Injet. TE <>0, soma, 0)",
-    "tarifa_inj_tusd": "boleto*IF(tarifa_cheia_trib3=0, MAXIFS(tarifa, descricao='Energia Inj. TUSD'), 0)",
-    "tarifa_inj_te": "boleto*IF(tarifa_cheia_trib3=0, MAXIFS(tarifa, descricao='Energia Injet. TE'), 0)",
-    "tarifa_cheia": "IF(tarifa_cheia_trib3=0, tarifa_inj_tusd+tarifa_inj_te, tarifa_cheia_trib3)",
-    "tarifa_paga_conc": "tarifa_cheia_trib2 + tarifa_cheia",
-    "tarifa_erb": "(1-desconto_contratado)*tarifa_cheia_trib2",
-    "tarifa_bol": "tarifa_erb - tarifa_paga_conc",
-    "Bandeira Amarela": "XLOOKUP(numero&'Bandeira Amarela', numero&descricao, tarifa,0)",
-    "Band. Am. Injet.": "boleto*XLOOKUP(numero&'Band. Am. Injet.', numero&descricao, tarifa,0)",
-    "valor_band_amarela": "boleto*(Bandeira Amarela + Band. Am. Injet.)",
-    "valor_band_amar_desc": "boleto*((1-desconto)*(Bandeira Amarela - valor_band_amarela))",
-    "Band. Vermelha": "boleto*XLOOKUP(numero&'Band. Vermelha', numero&descricao, tarifa,0)",
-    "Band. Vrm. Injet.": "boleto*XLOOKUP(numero&'Band. Vrm. Injet.', numero&descricao, tarifa,0)",
-    "valor_band_vermelha": "boleto*(Band. Vermelha + Band. Vrm. Injet.)",
-    "valor_band_vrm_desc": "boleto*((1-desconto)*(Band. Vermelha - valor_band_vermelha))",
-    "tarifa_total_boleto": "boleto*valor_band_vrm_desc + valor_band_amar_desc + tarifa_bol",
-    "valor_total_boleto": "tarifa_total_boleto * med_inj_tusd",
-    "periodo": "XLOOKUP(numero, fatura_itens[numero], fatura_itens[referencia], '')",
-    "nome": "XLOOKUP(numero, fatura_itens[numero], fatura_itens[nome], '')",
-}
 
 
 # =============================================================================
@@ -77,7 +37,7 @@ def _to_float(x) -> float:
         return float("nan")
     try:
         return float(s)
-    except:
+    except Exception:
         return float("nan")
 
 
@@ -124,15 +84,11 @@ def compute_custo_disp(n_fases: Optional[int]) -> Optional[float]:
     return None
 
 
-# =============================================================================
-# Engine
-# =============================================================================
-
 @dataclass
 class CalcResult:
     df_boletos: pd.DataFrame
-    missing_clientes: List[str]  # lista de UCs não cadastradas
-    missing_reason: Dict[str, str]  # UC -> motivo
+    missing_clientes: List[str]          # lista de UCs não cadastradas
+    missing_reason: Dict[str, str]       # UC -> motivo
 
 
 def _prepare_inputs(
@@ -144,40 +100,39 @@ def _prepare_inputs(
     dfm = df_medidores.copy()
     dfc = df_clientes.copy()
 
-    # strings-chave
-    for col in ["numero", "unidade_consumidora", "descricao", "referencia", "nome"]:
+    # strings-chave (itens)
+    for col in ["numero", "unidade_consumidora", "descricao", "referencia", "nome",
+                "vencimento", "cnpj", "cnpj_cpf", "cep", "cidade_uf", "cliente_numero"]:
         if col in dfi.columns:
             dfi[col] = dfi[col].astype(str)
 
+    # strings-chave (medidores)
     for col in ["nota_fiscal_numero", "tipo", "unidade_consumidora"]:
         if col in dfm.columns:
             dfm[col] = dfm[col].astype(str)
 
+    # strings-chave (clientes)
     for col in ["unidade_consumidora", "status"]:
         if col in dfc.columns:
             dfc[col] = dfc[col].astype(str)
 
-    # numéricos
-    for col in ["tarifa", "quantidade_registrada", "total_apurado"]:
+    # numéricos (itens)
+    for col in ["tarifa", "quantidade_registrada", "valor", "total_pagar", "injetada_calculo"]:
         if col in dfi.columns:
             dfi[col] = pd.to_numeric(dfi[col], errors="coerce")
+
+    # numéricos (medidores)
     if "total_apurado" in dfm.columns:
         dfm["total_apurado"] = pd.to_numeric(dfm["total_apurado"], errors="coerce")
 
+    # numéricos (clientes)
     for col in ["desconto_contratado", "subvencao", "custo_disp", "n_fases"]:
         if col in dfc.columns:
             dfc[col] = pd.to_numeric(dfc[col], errors="coerce")
 
     # normalizados (comparação)
-    if "descricao" in dfi.columns:
-        dfi["_desc_norm"] = dfi["descricao"].map(_norm_text)
-    else:
-        dfi["_desc_norm"] = ""
-
-    if "tipo" in dfm.columns:
-        dfm["_tipo_norm"] = dfm["tipo"].map(_norm_text)
-    else:
-        dfm["_tipo_norm"] = ""
+    dfi["_desc_norm"] = dfi["descricao"].map(_norm_text) if "descricao" in dfi.columns else ""
+    dfm["_tipo_norm"] = dfm["tipo"].map(_norm_text) if "tipo" in dfm.columns else ""
 
     return dfi, dfm, dfc
 
@@ -190,8 +145,7 @@ def _first_by_numero(dfi: pd.DataFrame, col: str) -> pd.Series:
         return pd.Series(dtype=object)
 
     tmp = dfi[["numero", col]].dropna(subset=["numero"])
-    # primeiro por ordem original
-    tmp = tmp.drop_duplicates(subset=["numero"], keep="first")
+    tmp = tmp.drop_duplicates(subset=["numero"], keep="first")  # primeira ocorrência
     return tmp.set_index("numero")[col]
 
 
@@ -229,6 +183,28 @@ def _max_tarifa_numero_desc(dfi: pd.DataFrame, numero: str, desc: str, default: 
     return default if pd.isna(v) else float(v)
 
 
+def _max_tarifa_numero_desc_injetada_calculo_eq_1(dfi: pd.DataFrame, numero: str, desc: str, default: float = 0.0) -> float:
+    """
+    Replica o critério do Excel (MAXIFS com critério injetada_calculo = 1).
+    Na prática, se a coluna não existir ou não houver registros com == 1, retorna 0.
+    """
+    if "injetada_calculo" not in dfi.columns:
+        return default
+
+    dn = _norm_text(desc)
+    sub = dfi[(dfi["numero"].astype(str) == str(numero)) & (dfi["_desc_norm"] == dn)].copy()
+    if sub.empty:
+        return default
+
+    sub["injetada_calculo"] = pd.to_numeric(sub["injetada_calculo"], errors="coerce")
+    sub = sub[sub["injetada_calculo"] == 1]
+    if sub.empty:
+        return default
+
+    v = sub["tarifa"].max()
+    return default if pd.isna(v) else float(v)
+
+
 def _energia_injetada_tarifa(
     dfi: pd.DataFrame,
     numero: str,
@@ -244,7 +220,7 @@ def _energia_injetada_tarifa(
 
     Excel (resumo):
     IF(AND(boleto=1, gerador=0, med_inj_tusd<>0),
-        média ponderada usando MAXIFS/MINIFS (assumindo 2 linhas),
+        média ponderada usando MAXIFS/MINIFS (tarifa max/min independentes de qtd max/min),
         XLOOKUP(med_inj_tusd&desc, quantidade&desc, tarifa, 0)
     )
     """
@@ -258,7 +234,7 @@ def _energia_injetada_tarifa(
     if sub.empty:
         return 0.0
 
-    # fallback XLOOKUP por quantidade == med_inj_tusd
+    # fallback XLOOKUP por quantidade == med_inj_tusd (procura primeira linha com igualdade)
     def xlookup_qty():
         if pd.isna(med_inj_tusd) or med_inj_tusd == 0:
             return 0.0
@@ -270,21 +246,12 @@ def _energia_injetada_tarifa(
 
     # condição do IF do Excel
     if gerador == 0 and (not pd.isna(med_inj_tusd)) and float(med_inj_tusd) != 0.0:
-        # média ponderada usando apenas max/min (o Excel faz assim)
-        # (tar_max*(qty_max/med) + tar_min*(qty_min/med)) / ((qty_max/med)+(qty_min/med))
-        if len(sub) == 1:
-            return float(sub.iloc[0]["tarifa"])
-
-        # pega max/min por quantidade
-        idx_max = sub["quantidade_registrada"].idxmax()
-        idx_min = sub["quantidade_registrada"].idxmin()
-        rmax = sub.loc[idx_max]
-        rmin = sub.loc[idx_min]
-
-        qty_max = float(rmax["quantidade_registrada"])
-        qty_min = float(rmin["quantidade_registrada"])
-        tar_max = float(rmax["tarifa"])
-        tar_min = float(rmin["tarifa"])
+        # ***FIEL AO EXCEL***:
+        # MAXIFS(tarifa) e MAXIFS(qtd) são independentes (podem vir de linhas diferentes)
+        tar_max = float(sub["tarifa"].max())
+        tar_min = float(sub["tarifa"].min())
+        qty_max = float(sub["quantidade_registrada"].max())
+        qty_min = float(sub["quantidade_registrada"].min())
 
         med = float(med_inj_tusd)
         w_max = qty_max / med
@@ -348,10 +315,16 @@ def calculate_boletos(
 
     base = pd.DataFrame({"numero": numeros}).sort_values("numero").reset_index(drop=True)
 
-    # XLOOKUPs: unidade_consumidora / periodo / nome
+    # XLOOKUPs: unidade_consumidora / periodo / nome / vencimento / cnpj / etc
     uc_map = _first_by_numero(dfi, "unidade_consumidora")
     periodo_map = _first_by_numero(dfi, "referencia") if "referencia" in dfi.columns else pd.Series(dtype=object)
     nome_map = _first_by_numero(dfi, "nome") if "nome" in dfi.columns else pd.Series(dtype=object)
+    venc_map = _first_by_numero(dfi, "vencimento") if "vencimento" in dfi.columns else pd.Series(dtype=object)
+    cep_map = _first_by_numero(dfi, "cep") if "cep" in dfi.columns else pd.Series(dtype=object)
+    ciduf_map = _first_by_numero(dfi, "cidade_uf") if "cidade_uf" in dfi.columns else pd.Series(dtype=object)
+    cnpj_map = _first_by_numero(dfi, "cnpj") if "cnpj" in dfi.columns else _first_by_numero(dfi, "cnpj_cpf")
+    cli_num_map = _first_by_numero(dfi, "cliente_numero") if "cliente_numero" in dfi.columns else pd.Series(dtype=object)
+    total_pagar_map = _first_by_numero(dfi, "total_pagar") if "total_pagar" in dfi.columns else pd.Series(dtype=object)
 
     base["unidade_consumidora"] = base["numero"].map(uc_map).astype(str)
 
@@ -378,7 +351,6 @@ def calculate_boletos(
         base = base.loc[~miss].copy()
 
     if only_status_ativo:
-        # se não houver status, não bloqueia; se houver e não for ativo, exclui
         mask_inativo = base["status_norm"].notna() & (base["status_norm"] != "ativo")
         if mask_inativo.any():
             for uc in base.loc[mask_inativo, "unidade_consumidora"].astype(str).tolist():
@@ -389,19 +361,25 @@ def calculate_boletos(
     base["periodo"] = base["numero"].map(periodo_map)
     base["nome"] = base["numero"].map(nome_map)
 
+    # metadados úteis para emissão de boleto
+    base["vencimento"] = base["numero"].map(venc_map)
+    base["cnpj_cpf"] = base["numero"].map(cnpj_map)
+    base["cep"] = base["numero"].map(cep_map)
+    base["cidade_uf"] = base["numero"].map(ciduf_map)
+    base["cliente_numero"] = base["numero"].map(cli_num_map)
+    base["total_pagar"] = base["numero"].map(total_pagar_map)
+
     # -----------------------------
     # medidores_apurado (Energia - Energia injetada)
     # -----------------------------
     dfm2 = dfm.copy()
     dfm2["numero"] = dfm2["nota_fiscal_numero"].astype(str)
 
-    # soma por tipo
     g = dfm2.groupby(["numero", "_tipo_norm"])["total_apurado"].sum(min_count=1).unstack()
 
     energia = g.get(_norm_text("Energia"), pd.Series(dtype=float))
     inj = g.get(_norm_text("Energia injetada"), pd.Series(dtype=float))
     if inj.empty:
-        # tolerância a "Energia Injetada"
         inj = g.get(_norm_text("Energia Injetada"), pd.Series(dtype=float))
 
     base["medidores_apurado"] = base["numero"].map(energia).fillna(0.0) - base["numero"].map(inj).fillna(0.0)
@@ -434,14 +412,16 @@ def calculate_boletos(
     base["check"] = base["tarifa_cheia_trib"].map(_check)
 
     # -----------------------------
+    # subvencao
+    # -----------------------------
+    base["subvencao"] = pd.to_numeric(base["subvencao"], errors="coerce")
+
+    # -----------------------------
     # tarifa_cheia_trib2 (exclui linhas onde quantidade_registrada == subvencao quando check != Certo)
     # -----------------------------
     cons = dfi[dfi["_desc_norm"].isin({_norm_text("Consumo TE"), _norm_text("Consumo TUSD")})].copy()
     cons = cons.merge(base[["numero", "subvencao"]], on="numero", how="left")
     cons["subvencao"] = pd.to_numeric(cons["subvencao"], errors="coerce")
-
-    # critério "<>"&subvencao
-    # se subvencao é NaN -> mantém tudo
     cons["_keep"] = cons["subvencao"].isna() | (cons["quantidade_registrada"] != cons["subvencao"])
     cons2 = cons[cons["_keep"]]
     cons_sum_excl = cons2.groupby("numero")["tarifa"].sum(min_count=1)
@@ -451,14 +431,19 @@ def calculate_boletos(
     base.loc[mask_sub, "tarifa_cheia_trib2"] = base.loc[mask_sub, "numero"].map(cons_sum_excl).fillna(0.0)
 
     # -----------------------------
-    # gerador
-    # (no Excel usa XLOOKUP do primeiro tipo; aqui usamos "existe Energia injetada" -> 1)
+    # gerador (FIEL AO EXCEL: XLOOKUP do PRIMEIRO tipo do medidor)
     # -----------------------------
-    inj_exists = (
-        dfm2.groupby("numero")["_tipo_norm"]
-        .apply(lambda s: int((_norm_text("Energia injetada") in set(s)) or (_norm_text("Energia Injetada") in set(s))))
+    first_tipo = (
+        dfm2[["numero", "_tipo_norm"]]
+        .dropna(subset=["numero"])
+        .drop_duplicates(subset=["numero"], keep="first")  # ordem original
+        .set_index("numero")["_tipo_norm"]
     )
-    base["gerador"] = base["numero"].map(inj_exists).fillna(0).astype(int)
+    gerador_map = (
+        (first_tipo == _norm_text("Energia injetada"))
+        | (first_tipo == _norm_text("Energia Injetada"))
+    ).astype(int)
+    base["gerador"] = base["numero"].map(gerador_map).fillna(0).astype(int)
 
     # -----------------------------
     # med_inj_tusd
@@ -467,6 +452,13 @@ def calculate_boletos(
     qtd_inj_tusd = _sum_qtd_by_desc(dfi, "Energia Inj. TUSD")
     inj_med_sum = base["numero"].map(inj).fillna(0.0)
     base["med_inj_tusd"] = base["boleto"] * (base["numero"].map(qtd_inj_tusd).fillna(0.0) - inj_med_sum)
+
+    # -----------------------------
+    # injetada_calculo (se não veio do parser, cria a coluna a partir de medidores_apurado)
+    # -----------------------------
+    if "injetada_calculo" not in dfi.columns:
+        dfi = dfi.copy()
+        dfi["injetada_calculo"] = dfi["numero"].map(base.set_index("numero")["medidores_apurado"])
 
     # -----------------------------
     # Energia Inj. TUSD / Energia Injet. TE (tarifas derivadas)
@@ -493,7 +485,7 @@ def calculate_boletos(
     )
 
     # -----------------------------
-    # tarifa_inj_tusd / tarifa_inj_te (fallback quando trib3==0)
+    # tarifa_inj_tusd / tarifa_inj_te (fallback quando trib3==0) — com critério injetada_calculo==1
     # -----------------------------
     tarifa_inj_tusd = []
     tarifa_inj_te = []
@@ -508,8 +500,8 @@ def calculate_boletos(
             tarifa_inj_te.append(0.0)
             continue
 
-        tarifa_inj_tusd.append(_max_tarifa_numero_desc(dfi, num, "Energia Inj. TUSD", default=0.0))
-        tarifa_inj_te.append(_max_tarifa_numero_desc(dfi, num, "Energia Injet. TE", default=0.0))
+        tarifa_inj_tusd.append(_max_tarifa_numero_desc_injetada_calculo_eq_1(dfi, num, "Energia Inj. TUSD", default=0.0))
+        tarifa_inj_te.append(_max_tarifa_numero_desc_injetada_calculo_eq_1(dfi, num, "Energia Injet. TE", default=0.0))
 
     base["tarifa_inj_tusd"] = tarifa_inj_tusd
     base["tarifa_inj_te"] = tarifa_inj_te
@@ -572,13 +564,19 @@ def calculate_boletos(
     base["valor_total_boleto"] = base["tarifa_total_boleto"] * base["med_inj_tusd"]
 
     # -----------------------------
-    # Saída final (snake_case)
+    # Saída final
     # -----------------------------
     out_cols = [
         "numero",
         "unidade_consumidora",
         "periodo",
         "nome",
+        "vencimento",
+        "cnpj_cpf",
+        "cep",
+        "cidade_uf",
+        "cliente_numero",
+        "total_pagar",
         "custo_disp",
         "medidores_apurado",
         "injetada",
@@ -612,8 +610,6 @@ def calculate_boletos(
     ]
 
     df_out = base[out_cols].copy()
-
-    # padroniza NaN -> None (BigQuery friendly)
     df_out = df_out.replace({np.nan: None})
 
     return CalcResult(
