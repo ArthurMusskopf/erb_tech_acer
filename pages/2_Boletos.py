@@ -1,359 +1,302 @@
 """
-ERB Tech - Tela 2: Cálculo e Validação de Boletos
-VERSÃO FINAL DEFINITIVA - Baseada no Excel Formulario_ERB_TechArt.xlsx
+ERB Tech - Tela 2: Boletos (cálculo fiel + emissão Sicoob Sandbox)
 """
 
-import streamlit as st
-import pandas as pd
-import numpy as np
-from datetime import datetime
+import base64
+from datetime import datetime, timedelta
 from pathlib import Path
-import io
 import sys
+import io
+
+import pandas as pd
+import streamlit as st
 
 sys.path.append(str(Path(__file__).parent.parent))
 
 from utils.bigquery_client import (
     execute_query,
+    upsert_dataframe,
     get_periodos_disponiveis,
-    get_historico_cliente,
     TABLE_FATURA_ITENS,
-    TABLE_CLIENTES
+    TABLE_MEDIDORES,
+    TABLE_CLIENTES,
+    TABLE_BOLETOS,
+)
+
+from utils.calc_engine import calculate_boletos
+from utils.sicoob_client import (
+    get_sicoob_config_from_secrets,
+    SicoobCobrancaV3Client,
+    build_boleto_payload_from_row,
 )
 
 st.set_page_config(page_title="Boletos - ERB Tech", page_icon="💰", layout="wide")
-st.title("💰 Boletos de Cobrança")
+st.title("💰 Boletos de Cobrança (ACER)")
 
 
-def safe_float(val, default=0.0):
-    """Converte qualquer valor para float de forma segura"""
-    if val is None:
-        return default
-    if isinstance(val, (pd.Series, np.ndarray)):
-        val = val.iloc[0] if len(val) > 0 else default
-    if pd.isna(val):
-        return default
-    try:
-        return float(val)
-    except:
-        return default
-
-
-def carregar_dados_periodo(periodo: str) -> pd.DataFrame:
+@st.cache_data(ttl=60, show_spinner=False)
+def load_boletos_calculados(periodo: str) -> pd.DataFrame:
+    q = f"""
+    SELECT *
+    FROM `{TABLE_BOLETOS}`
+    WHERE periodo = @p
+    ORDER BY nome
     """
-    Carrega dados das faturas - SEM colunas duplicadas
-    Baseado na estrutura do Excel Calculos_Boleto
-    """
-    query = f"""
-    WITH itens_agregados AS (
-        SELECT 
-            unidade_consumidora,
-            nome,
-            referencia,
-            vencimento,
-            MAX(numero) as nota_fiscal,
-            MAX(cnpj) as cnpj,
-            MAX(total_pagar) as total_concessionaria,
-            -- Consumo
-            SUM(CASE WHEN codigo = '0D' THEN quantidade_registrada ELSE 0 END) as consumo_kwh,
-            SUM(CASE WHEN codigo = '0D' THEN valor ELSE 0 END) as consumo_te,
-            SUM(CASE WHEN codigo = '0E' THEN valor ELSE 0 END) as consumo_tusd,
-            -- Injetada (valores já são negativos no banco)
-            SUM(CASE WHEN codigo IN ('0R', '0S') THEN ABS(quantidade_registrada) ELSE 0 END) as injetada_kwh,
-            SUM(CASE WHEN codigo = '0R' THEN valor ELSE 0 END) as inj_te,
-            SUM(CASE WHEN codigo = '0S' THEN valor ELSE 0 END) as inj_tusd,
-            -- Bandeiras
-            SUM(CASE WHEN codigo = '2L' THEN valor ELSE 0 END) as band_amarela,
-            SUM(CASE WHEN codigo = '2M' THEN valor ELSE 0 END) as band_amarela_inj,
-            SUM(CASE WHEN codigo = '2U' THEN valor ELSE 0 END) as band_vermelha,
-            SUM(CASE WHEN codigo = '2V' THEN valor ELSE 0 END) as band_vermelha_inj
-        FROM `{TABLE_FATURA_ITENS}`
-        WHERE referencia = '{periodo}'
-        GROUP BY unidade_consumidora, nome, referencia, vencimento
-    )
-    SELECT 
-        i.*,
-        COALESCE(c.desconto_contratado, 0.15) as desconto,
-        COALESCE(c.subvencao, 0) as subvencao_cliente
-    FROM itens_agregados i
-    LEFT JOIN `{TABLE_CLIENTES}` c 
-        ON i.unidade_consumidora = c.unidade_consumidora
-    WHERE i.injetada_kwh > 0
-    ORDER BY i.nome
-    """
-    return execute_query(query)
+    return execute_query(q, {"p": periodo})
 
 
-def calcular_boleto(row) -> dict:
-    """
-    Calcula boleto baseado na lógica do Excel Formulario_ERB_TechArt.xlsx
-    Aba: Calculos_Boleto
-    """
-    # Extrair valores com segurança
-    consumo_te = safe_float(row.get('consumo_te'))
-    consumo_tusd = safe_float(row.get('consumo_tusd'))
-    inj_te = safe_float(row.get('inj_te'))  # Já é negativo
-    inj_tusd = safe_float(row.get('inj_tusd'))  # Já é negativo
-    
-    band_amarela = safe_float(row.get('band_amarela'))
-    band_amarela_inj = safe_float(row.get('band_amarela_inj'))
-    band_vermelha = safe_float(row.get('band_vermelha'))
-    band_vermelha_inj = safe_float(row.get('band_vermelha_inj'))
-    
-    desconto = safe_float(row.get('desconto'), 0.15)
-    subvencao = safe_float(row.get('subvencao_cliente'), 0)
-    
-    # Cálculos conforme Excel
-    # tarifa_cheia = Consumo TE + Consumo TUSD
-    tarifa_cheia = consumo_te + consumo_tusd
-    
-    # tarifa_injetada = Inj TE + Inj TUSD (valores negativos)
-    tarifa_injetada = inj_te + inj_tusd
-    
-    # tarifa_paga_conc = tarifa_cheia + tarifa_injetada
-    tarifa_paga_conc = tarifa_cheia + tarifa_injetada
-    
-    # tarifa_erb = desconto aplicado
-    tarifa_erb = tarifa_paga_conc * desconto
-    
-    # tarifa_bol = valor que vai pro boleto (85% se desconto for 15%)
-    tarifa_bol = tarifa_paga_conc * (1 - desconto)
-    
-    # Bandeiras líquidas
-    valor_band_amarela = band_amarela + band_amarela_inj
-    valor_band_vermelha = band_vermelha + band_vermelha_inj
-    
-    # Bandeiras com desconto
-    valor_band_amar_desc = valor_band_amarela * (1 - desconto)
-    valor_band_vrm_desc = valor_band_vermelha * (1 - desconto)
-    
-    # Total boleto
-    valor_bruto = tarifa_bol + valor_band_amar_desc + valor_band_vrm_desc
-    valor_final = max(0, valor_bruto - subvencao)
-    
-    # Gerar boleto apenas se houver energia injetada e valor > 0
-    gerar = valor_final > 0 and tarifa_injetada < 0
-    
-    return {
-        'tarifa_cheia': tarifa_cheia,
-        'tarifa_injetada': tarifa_injetada,
-        'tarifa_paga_conc': tarifa_paga_conc,
-        'tarifa_erb': tarifa_erb,
-        'tarifa_bol': tarifa_bol,
-        'valor_band_amarela': valor_band_amarela,
-        'valor_band_vermelha': valor_band_vermelha,
-        'valor_band_amar_desc': valor_band_amar_desc,
-        'valor_band_vrm_desc': valor_band_vrm_desc,
-        'valor_bruto': valor_bruto,
-        'desconto': desconto,
-        'subvencao': subvencao,
-        'valor_final': valor_final,
-        'gerar_boleto': gerar
-    }
+def recalc_and_persist(periodo: str) -> pd.DataFrame:
+    with st.spinner("Carregando dados do BigQuery e recalculando..."):
+        df_itens = execute_query(f"SELECT * FROM `{TABLE_FATURA_ITENS}` WHERE referencia = @p", {"p": periodo})
+        df_med = execute_query(f"SELECT * FROM `{TABLE_MEDIDORES}` WHERE referencia = @p", {"p": periodo})
+
+        # clientes usados no período (somente UCs que aparecem)
+        ucs = []
+        if df_itens is not None and not df_itens.empty and "unidade_consumidora" in df_itens.columns:
+            ucs = df_itens["unidade_consumidora"].dropna().astype(str).unique().tolist()
+
+        if ucs:
+            df_cli = execute_query(
+                f"SELECT * FROM `{TABLE_CLIENTES}` WHERE unidade_consumidora IN UNNEST(@ucs)",
+                {"ucs": ucs},
+            )
+        else:
+            df_cli = pd.DataFrame()
+
+        res = calculate_boletos(
+            df_itens=df_itens,
+            df_medidores=df_med,
+            df_clientes=df_cli,
+            only_registered_clients=True,
+            only_status_ativo=True,
+        )
+
+        if res.missing_clientes:
+            st.warning(f"Existem {len(res.missing_clientes)} UC(s) sem cadastro ativo. Cadastre abaixo e recalcule.")
+            st.session_state["missing_clientes_boletos"] = res.missing_clientes
+            st.session_state["missing_reason_boletos"] = res.missing_reason
+
+        df_out = res.df_boletos.copy()
+        if df_out is None or df_out.empty:
+            st.warning("Cálculo retornou vazio.")
+            return pd.DataFrame()
+
+        upsert_dataframe(df_out, TABLE_BOLETOS, key_column="numero")
+        st.success(f"✅ Gravado em {TABLE_BOLETOS}: {len(df_out)} linhas.")
+        return df_out
 
 
-# =============================================================================
-# INTERFACE
-# =============================================================================
+def render_cadastro_clientes(missing: list[str]) -> None:
+    st.markdown("### 🧾 Cadastro rápido de UCs pendentes")
 
-col1, col2, col3, col4 = st.columns(4)
+    with st.expander("Abrir formulário de cadastro", expanded=True):
+        for uc in missing:
+            with st.form(f"form_uc_{uc}"):
+                st.markdown(f"#### UC **{uc}**")
+                col1, col2, col3, col4 = st.columns(4)
+                with col1:
+                    desconto = st.number_input("Desconto contratado", min_value=0.0, max_value=1.0, value=0.15, step=0.01)
+                with col2:
+                    subv = st.number_input("Subvenção", min_value=0.0, value=0.0, step=50.0)
+                with col3:
+                    custo_disp = st.number_input("Custo disponibilidade", min_value=0.0, value=100.0, step=10.0)
+                with col4:
+                    status = st.selectbox("Status", ["Ativo", "Inativo"], index=0)
 
-with col1:
-    try:
-        periodos = get_periodos_disponiveis()
-        if not periodos:
-            periodos = ["12/2025", "11/2025", "10/2025"]
-    except:
-        periodos = ["12/2025", "11/2025", "10/2025"]
-    periodo = st.selectbox("Período de Referência", periodos)
+                nome = st.text_input("Nome (opcional)", value="")
+                cnpj = st.text_input("CNPJ/CPF (opcional)", value="")
+                cep = st.text_input("CEP (opcional)", value="")
+                cidade_uf = st.text_input("Cidade/UF (opcional)", value="")
 
-with col2:
-    status_filtro = st.selectbox("Status", ["Todos", "Com boleto", "Sem boleto"])
+                ok = st.form_submit_button("Salvar UC")
+                if ok:
+                    df = pd.DataFrame([{
+                        "unidade_consumidora": str(uc),
+                        "desconto_contratado": float(desconto),
+                        "subvencao": float(subv),
+                        "custo_disp": float(custo_disp),
+                        "status": str(status),
+                        "nome": nome,
+                        "cnpj": cnpj,
+                        "cep": cep,
+                        "cidade_uf": cidade_uf,
+                    }])
+                    upsert_dataframe(df, TABLE_CLIENTES, key_column="unidade_consumidora")
+                    st.success("✅ UC cadastrada/atualizada.")
 
-with col3:
-    ordenar_por = st.selectbox("Ordenar por", ["Nome", "Valor (maior)", "Valor (menor)"])
 
-with col4:
+# ---------------- UI topo ----------------
+colA, colB, colC, colD = st.columns([2, 1, 1, 1])
+
+with colA:
+    periodos = get_periodos_disponiveis()
+    periodo = st.selectbox("Período de referência", options=periodos if periodos else ["(sem dados)"])
+with colB:
     st.markdown("<br>", unsafe_allow_html=True)
-    recalcular = st.button("🔄 Carregar/Recalcular")
+    btn_load = st.button("📥 Carregar", use_container_width=True, disabled=(periodo == "(sem dados)"))
+with colC:
+    st.markdown("<br>", unsafe_allow_html=True)
+    btn_recalc = st.button("🧮 Recalcular e gravar", use_container_width=True, disabled=(periodo == "(sem dados)"))
+with colD:
+    st.markdown("<br>", unsafe_allow_html=True)
+    filtro = st.selectbox("Filtro", ["Cobrança (valor>0)", "Geradores (valor<0)", "Todos"], index=0)
 
 st.markdown("---")
 
-# Carregar dados
-if recalcular or 'boletos_df' not in st.session_state or st.session_state.get('periodo_atual') != periodo:
-    try:
-        with st.spinner("Carregando dados do BigQuery..."):
-            df = carregar_dados_periodo(periodo)
-            
-            if df.empty:
-                st.warning(f"Nenhuma fatura com energia injetada encontrada para {periodo}")
-                st.stop()
-            
-            # Calcular boletos
-            calculos = df.apply(calcular_boleto, axis=1)
-            calculos_df = pd.DataFrame(calculos.tolist())
-            df = pd.concat([df.reset_index(drop=True), calculos_df], axis=1)
-            
-            st.session_state.boletos_df = df
-            st.session_state.periodo_atual = periodo
-            
-    except Exception as e:
-        st.error(f"Erro ao carregar dados: {e}")
-        st.exception(e)
-        st.stop()
+# cadastro pendências (se existirem)
+missing = st.session_state.get("missing_clientes_boletos", [])
+if missing:
+    render_cadastro_clientes(missing)
 
-# Exibir dados
-if 'boletos_df' in st.session_state:
-    df = st.session_state.boletos_df.copy()
-    
-    # Filtros
-    if status_filtro == "Com boleto":
-        df = df[df['gerar_boleto'] == True]
-    elif status_filtro == "Sem boleto":
-        df = df[df['gerar_boleto'] == False]
-    
-    # Ordenação
-    if ordenar_por == "Valor (maior)":
-        df = df.sort_values('valor_final', ascending=False)
-    elif ordenar_por == "Valor (menor)":
-        df = df.sort_values('valor_final', ascending=True)
-    else:
-        df = df.sort_values('nome')
-    
-    # Resumo
-    col1, col2, col3, col4 = st.columns(4)
-    
-    df_com_boleto = df[df['gerar_boleto'] == True]
-    total_boletos = len(df_com_boleto)
-    total_valor = safe_float(df_com_boleto['valor_final'].sum())
-    total_faturas = len(df)
-    economia_total = abs(safe_float(df['tarifa_injetada'].sum()))
-    
-    col1.metric("Total de Faturas", total_faturas)
-    col2.metric("Boletos a Gerar", total_boletos)
-    col3.metric("Valor Total", f"R$ {total_valor:,.2f}")
-    col4.metric("Economia Total", f"R$ {economia_total:,.2f}")
-    
-    st.markdown("---")
-    st.markdown(f"### 📋 Boletos - {periodo}")
-    
-    # Lista de boletos
-    for idx, row in df.iterrows():
-        # Extrair valores com safe_float
-        gerar = bool(row.get('gerar_boleto', False))
-        valor_final = safe_float(row.get('valor_final'))
-        nome = str(row.get('nome', 'N/A'))[:50]
-        uc = str(row.get('unidade_consumidora', ''))
-        
-        status_icon = "🟢" if gerar else "🔴"
-        valor_display = f"R$ {valor_final:,.2f}" if gerar else "Sem boleto"
-        
-        with st.expander(f"{status_icon} **{nome}** | UC: {uc} | **{valor_display}**"):
-            col1, col2 = st.columns([2, 1])
-            
-            with col1:
-                st.markdown("#### 📊 Dados do Consumo")
-                
-                consumo_kwh = safe_float(row.get('consumo_kwh'))
-                injetada_kwh = safe_float(row.get('injetada_kwh'))
-                
-                consumo_df = pd.DataFrame({
-                    'Item': ['Consumo Total', 'Energia Injetada', 'Saldo Líquido'],
-                    'kWh': [f"{consumo_kwh:,.0f}", f"{injetada_kwh:,.0f}", f"{consumo_kwh - injetada_kwh:,.0f}"]
-                })
-                st.dataframe(consumo_df, use_container_width=True, hide_index=True)
-                
-                st.markdown("#### 💵 Memorial de Cálculo")
-                
-                # Extrair todos os valores com safe_float
-                tarifa_cheia = safe_float(row.get('tarifa_cheia'))
-                tarifa_injetada = safe_float(row.get('tarifa_injetada'))
-                tarifa_paga_conc = safe_float(row.get('tarifa_paga_conc'))
-                desconto = safe_float(row.get('desconto'), 0.15)
-                tarifa_erb = safe_float(row.get('tarifa_erb'))
-                tarifa_bol = safe_float(row.get('tarifa_bol'))
-                valor_band_amar_desc = safe_float(row.get('valor_band_amar_desc'))
-                valor_band_vrm_desc = safe_float(row.get('valor_band_vrm_desc'))
-                valor_bruto = safe_float(row.get('valor_bruto'))
-                subvencao = safe_float(row.get('subvencao'))
-                
-                calculo_df = pd.DataFrame({
-                    'Descrição': [
-                        'Consumo (TE + TUSD)',
-                        'Energia Injetada (crédito)',
-                        'Tarifa Paga Concessionária',
-                        f'Desconto ERB ({desconto*100:.0f}%)',
-                        'Tarifa Boleto (85%)',
-                        'Bandeira Amarela c/ desc',
-                        'Bandeira Vermelha c/ desc',
-                        'Valor Bruto',
-                        'Subvenção',
-                        '**VALOR FINAL**'
-                    ],
-                    'Valor (R$)': [
-                        f'{tarifa_cheia:,.2f}',
-                        f'{tarifa_injetada:,.2f}',
-                        f'{tarifa_paga_conc:,.2f}',
-                        f'-{tarifa_erb:,.2f}',
-                        f'{tarifa_bol:,.2f}',
-                        f'{valor_band_amar_desc:,.2f}',
-                        f'{valor_band_vrm_desc:,.2f}',
-                        f'{valor_bruto:,.2f}',
-                        f'-{subvencao:,.2f}',
-                        f'**{valor_final:,.2f}**'
-                    ]
-                })
-                st.dataframe(calculo_df, use_container_width=True, hide_index=True)
-            
-            with col2:
-                st.markdown("#### 📋 Dados do Cliente")
-                nota_fiscal = row.get('nota_fiscal') or 'N/A'
-                cnpj = row.get('cnpj') or 'N/A'
-                vencimento = row.get('vencimento') or 'N/A'
-                
-                st.markdown(f"""
-                - **Nota Fiscal:** {nota_fiscal}
-                - **CNPJ/CPF:** {cnpj}
-                - **Vencimento:** {vencimento}
-                - **Desconto:** {desconto*100:.0f}%
-                - **Subvenção:** R$ {subvencao:,.2f}
-                """)
-                
-                st.markdown("#### 🎯 Ações")
-                
-                if st.button("📜 Ver Histórico", key=f"hist_{idx}", use_container_width=True):
-                    try:
-                        hist = get_historico_cliente(uc)
-                        if not hist.empty:
-                            st.dataframe(hist, use_container_width=True, hide_index=True)
-                        else:
-                            st.info("Nenhum histórico encontrado")
-                    except Exception as e:
-                        st.error(f"Erro: {e}")
+# carregamento
+dfb = pd.DataFrame()
+if btn_recalc and periodo != "(sem dados)":
+    dfb = recalc_and_persist(periodo)
+elif btn_load and periodo != "(sem dados)":
+    with st.spinner("Carregando boletos calculados..."):
+        dfb = load_boletos_calculados(periodo)
 
-    # Exportação
-    st.markdown("---")
-    st.markdown("### ⚡ Ações em Lote")
-    
-    col1, col2, col3 = st.columns(3)
-    
-    with col2:
-        if st.button("💾 Exportar para Excel", use_container_width=True):
-            export_cols = ['unidade_consumidora', 'nome', 'referencia', 'consumo_kwh', 
-                          'injetada_kwh', 'tarifa_cheia', 'tarifa_injetada', 
-                          'valor_final', 'desconto', 'subvencao']
-            export_df = df[[c for c in export_cols if c in df.columns]].copy()
-            
-            output = io.BytesIO()
-            export_df.to_excel(output, index=False)
-            output.seek(0)
-            
-            st.download_button(
-                "⬇️ Download Excel",
-                data=output,
-                file_name=f"boletos_{periodo.replace('/', '_')}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
+if dfb is None or dfb.empty:
+    st.info("Carregue um período ou recalcule para gerar a base de boletos.")
+    st.stop()
 
+# filtros
+dfb["valor_total_boleto_num"] = pd.to_numeric(dfb["valor_total_boleto"], errors="coerce").fillna(0.0)
+
+if filtro == "Cobrança (valor>0)":
+    df_show = dfb[dfb["valor_total_boleto_num"] > 0].copy()
+elif filtro == "Geradores (valor<0)":
+    df_show = dfb[dfb["valor_total_boleto_num"] < 0].copy()
 else:
-    st.info("👆 Clique em 'Carregar/Recalcular' para carregar os dados.")
+    df_show = dfb.copy()
+
+# resumo
+col1, col2, col3, col4 = st.columns(4)
+col1.metric("Linhas", len(df_show))
+col2.metric("Cobranças (qtd)", int((df_show["valor_total_boleto_num"] > 0).sum()))
+col3.metric("Total cobranças (R$)", f"{df_show.loc[df_show['valor_total_boleto_num']>0,'valor_total_boleto_num'].sum():,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
+col4.metric("Total geradores (R$)", f"{df_show.loc[df_show['valor_total_boleto_num']<0,'valor_total_boleto_num'].sum():,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
+
+st.markdown("---")
+
+# Sicoob client
+try:
+    sicoob_cfg = get_sicoob_config_from_secrets()
+    sicoob = SicoobCobrancaV3Client(sicoob_cfg)
+    sicoob_ok = True
+except Exception as e:
+    sicoob_ok = False
+    st.warning(f"Sicoob não configurado em secrets.toml: {e}")
+
+st.markdown(f"### 📋 Boletos — {periodo}")
+
+for i, r in df_show.sort_values("nome").iterrows():
+    nome = str(r.get("nome") or "")[:60]
+    uc = str(r.get("unidade_consumidora") or "")
+    nf = str(r.get("numero") or "")
+    valor = float(r.get("valor_total_boleto_num") or 0.0)
+
+    tag = "🟢 COBRANÇA" if valor > 0 else ("🟣 GERADOR" if valor < 0 else "⚪ 0")
+    with st.expander(f"{tag} | {nome} | UC {uc} | NF {nf} | R$ {valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")):
+
+        colL, colR = st.columns([2, 1])
+
+        with colL:
+            st.markdown("#### 🧾 Memorial (cálculo)")
+            cols_show = [
+                "medidores_apurado", "custo_disp", "injetada", "med_inj_tusd",
+                "tarifa_cheia_trib2", "tarifa_cheia", "tarifa_paga_conc",
+                "tarifa_erb", "tarifa_bol",
+                "valor_band_amar_desc", "valor_band_vrm_desc",
+                "tarifa_total_boleto", "valor_total_boleto",
+                "check", "gerador", "boleto",
+            ]
+            mem = {c: r.get(c) for c in cols_show if c in df_show.columns}
+            st.dataframe(pd.DataFrame([mem]).T.rename(columns={0: "valor"}), use_container_width=True)
+
+        with colR:
+            st.markdown("#### 👤 Dados p/ boleto")
+            st.write(f"**Vencimento (fatura):** {r.get('vencimento')}")
+            st.write(f"**CNPJ/CPF:** {r.get('cnpj_cpf')}")
+            st.write(f"**CEP:** {r.get('cep')}")
+            st.write(f"**Cidade/UF:** {r.get('cidade_uf')}")
+
+            st.markdown("#### 🏦 Sicoob (Sandbox)")
+            if valor <= 0:
+                st.info("Para valor < 0 (geradores), isso é remuneração. Fluxo de pagamento fica para a próxima fase.")
+            else:
+                if not sicoob_ok:
+                    st.error("Sicoob não configurado.")
+                else:
+                    # vencimento: tenta converter "DD/MM/YYYY" -> YYYY-MM-DD; senão usa hoje+5
+                    venc_raw = str(r.get("vencimento") or "")
+                    venc_iso = None
+                    try:
+                        # casos comuns do parser
+                        dt = datetime.strptime(venc_raw, "%d/%m/%Y")
+                        venc_iso = dt.strftime("%Y-%m-%d")
+                    except Exception:
+                        venc_iso = (datetime.utcnow() + timedelta(days=5)).strftime("%Y-%m-%d")
+
+                    hoje_iso = datetime.utcnow().strftime("%Y-%m-%d")
+
+                    nosso_numero = st.number_input(
+                        "Nosso número (sandbox)",
+                        min_value=0,
+                        value=int(re.sub(r"\D+", "", nf)[:8] or "0"),
+                        step=1,
+                        key=f"nn_{nf}",
+                    )
+
+                    if st.button("🚀 Emitir boleto + baixar PDF", key=f"emit_{nf}", use_container_width=True):
+                        try:
+                            payload = build_boleto_payload_from_row(
+                                r.to_dict(),
+                                cfg=sicoob_cfg,
+                                nosso_numero=int(nosso_numero),
+                                data_emissao=hoje_iso,
+                                data_vencimento=venc_iso,
+                                valor=round(float(valor), 2),
+                            )
+                            resp_create = sicoob.create_boleto(payload)
+
+                            # tenta extrair nossoNumero retornado; se não vier, usa o enviado
+                            nosso_ret = (
+                                resp_create.get("resultado", {}).get("nossoNumero")
+                                if isinstance(resp_create, dict) else None
+                            ) or int(nosso_numero)
+
+                            st.success(f"✅ Boleto criado. NossoNúmero: {nosso_ret}")
+
+                            resp_pdf = sicoob.segunda_via_pdf(nosso_numero=nosso_ret, gerar_pdf=True)
+                            pdf_bytes = sicoob.decode_pdf_boleto(resp_pdf)
+
+                            st.download_button(
+                                "⬇️ Download PDF do Boleto",
+                                data=pdf_bytes,
+                                file_name=f"boleto_{nf}.pdf",
+                                mime="application/pdf",
+                                use_container_width=True,
+                            )
+
+                            # mostra linha digitável/qrCode se vierem
+                            res2 = resp_pdf.get("resultado", {})
+                            if res2.get("linhaDigitavel"):
+                                st.code(res2["linhaDigitavel"])
+                            if res2.get("qrCode"):
+                                st.text_area("QR Code (copia/cola)", value=res2["qrCode"], height=120)
+
+                        except Exception as e:
+                            st.error(f"Falha ao emitir/baixar boleto: {e}")
+
+st.markdown("---")
+st.markdown("### 📦 Exportação")
+buf = io.BytesIO()
+df_show.drop(columns=["valor_total_boleto_num"], errors="ignore").to_excel(buf, index=False)
+buf.seek(0)
+st.download_button(
+    "⬇️ Exportar Excel (boletos do filtro)",
+    data=buf,
+    file_name=f"boletos_{periodo.replace('/','_')}.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+)
