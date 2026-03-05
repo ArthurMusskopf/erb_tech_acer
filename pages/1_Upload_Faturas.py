@@ -372,11 +372,27 @@ with tab_revisao:
     n_sug = infer_n_fases(classe_mod) or 3
     custo_sug = int(compute_custo_disp(n_sug) or 100)
 
-    desconto_cur = float(pd.to_numeric(cli_row.get("desconto_contratado"), errors="coerce") or 0.15) if cli_row is not None else 0.15
-    subv_cur = float(pd.to_numeric(cli_row.get("subvencao"), errors="coerce") or 0.0) if cli_row is not None else 0.0
-    status_cur = str(cli_row.get("status") or "Ativo") if cli_row is not None else "Ativo"
-    n_cur = int(pd.to_numeric(cli_row.get("n_fases"), errors="coerce") or n_sug) if cli_row is not None else n_sug
-    custo_cur = int(pd.to_numeric(cli_row.get("custo_disp"), errors="coerce") or custo_sug) if cli_row is not None else custo_sug
+    # --- BLOCO 1 (SUBSTITUIR) | correção NaN -> int/float sem crash ---
+
+    def _num_or_default(x, default: float) -> float:
+        v = pd.to_numeric(x, errors="coerce")
+        if pd.isna(v):
+            return float(default)
+        return float(v)
+
+    def _int_or_default(x, default: int) -> int:
+        v = pd.to_numeric(x, errors="coerce")
+        if pd.isna(v):
+            return int(default)
+        return int(round(float(v), 0))
+
+# valores atuais (se existirem) - SEM quebrar quando vier NaN
+desconto_cur = _num_or_default(cli_row.get("desconto_contratado") if cli_row is not None else None, 0.15)
+subv_cur = _num_or_default(cli_row.get("subvencao") if cli_row is not None else None, 0.0)
+status_cur = str((cli_row.get("status") if cli_row is not None else None) or "Ativo")
+
+n_cur = _int_or_default(cli_row.get("n_fases") if cli_row is not None else None, int(n_sug))
+custo_cur = _int_or_default(cli_row.get("custo_disp") if cli_row is not None else None, int(custo_sug))
 
     motivo = _cadastro_motivo(cli_row)
     if motivo is None:
