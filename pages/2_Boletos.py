@@ -19,13 +19,16 @@ import streamlit as st
 
 sys.path.append(str(Path(__file__).parent.parent))
 
+import io
 from utils.bigquery_client import (
     execute_query,
     upsert_dataframe,
     TABLE_FATURA_ITENS,
     TABLE_MEDIDORES,
     TABLE_CLIENTES,
+    TABLE_BOLETOS,
 )
+from utils.boletos_adapter import calc_to_boletos_schema
 
 from utils.calc_engine import calculate_boletos, infer_n_fases, compute_custo_disp
 
@@ -327,6 +330,16 @@ if df_calc_nf is not None and not df_calc_nf.empty:
     row = df_calc_nf.iloc[0].to_dict()
     _render_calc_list(row)
 
+save_one = st.button("💾 Salvar cálculo desta NF em boletos_calculados", width="stretch")
+if save_one:
+    try:
+        df_it, _ = load_invoice_data(nf_sel)
+        df_bq = calc_to_boletos_schema(df_calc_nf, df_it, status="calculado")
+        upsert_dataframe(df_bq, TABLE_BOLETOS, key_column="id")
+        st.success("✅ Salvo em boletos_calculados.")
+    except Exception as e:
+        st.error(f"Erro ao salvar cálculo: {e}")
+        
     buf = io.BytesIO()
     df_calc_nf.to_excel(buf, index=False)
     buf.seek(0)
