@@ -20,7 +20,6 @@ import hashlib
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, Any, Tuple, Optional, List
-from utils.boletos_adapter import calc_to_boletos_schema
 
 import pandas as pd
 import streamlit as st
@@ -31,11 +30,6 @@ sys.path.append(str(Path(__file__).parent.parent))
 from utils.pdf_parser import processar_lote_faturas, make_item_id
 from utils.calc_engine import calculate_boletos, infer_n_fases, compute_custo_disp
 from utils.boletos_adapter import calc_to_boletos_schema
-from utils.sicoob_client import (
-    get_sicoob_config_from_secrets,
-    SicoobCobrancaV3Client,
-    build_boleto_payload_from_row,
-)
 from utils.bigquery_client import (
     upsert_dataframe,
     execute_query,
@@ -51,6 +45,7 @@ APP_VERSION = "upload_v2_lote_cadastro"
 st.set_page_config(page_title="Upload de Faturas - ERB Tech", page_icon="📄", layout="wide")
 st.title("📄 Upload, Revisão e Cálculo (por Lote)")
 st.caption(f"versão: {APP_VERSION}")
+
 
 # -----------------------------------------------------------------------------
 # Session state
@@ -79,6 +74,20 @@ def _to_iso_date(v: str) -> str:
             return (datetime.utcnow() + timedelta(days=5)).strftime("%Y-%m-%d")
 
 
+def _num_or_default(x, default: float) -> float:
+    v = pd.to_numeric(x, errors="coerce")
+    if pd.isna(v):
+        return float(default)
+    return float(v)
+
+
+def _int_or_default(x, default: int) -> int:
+    v = pd.to_numeric(x, errors="coerce")
+    if pd.isna(v):
+        return int(default)
+    return int(round(float(v), 0))
+
+
 def _recompute_ids_for_invoice(df_itens: pd.DataFrame, df_med: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     it = df_itens.copy()
     if "id" in it.columns:
@@ -93,7 +102,7 @@ def _recompute_ids_for_invoice(df_itens: pd.DataFrame, df_med: pd.DataFrame) -> 
         )
 
     med = df_med.copy()
-    if not med.empty:
+    if med is not None and not med.empty:
         med["id"] = med.apply(
             lambda r: hashlib.sha256(
                 f"{r.get('unidade_consumidora','')}|{r.get('cliente_numero','')}|{r.get('referencia','')}|{r.get('nota_fiscal_numero','')}|{r.get('medidor','')}|{r.get('tipo','')}|{r.get('posto','')}".encode()
@@ -180,7 +189,6 @@ def _calc_boleto_from_dfs(df_itens_nf: pd.DataFrame, df_med_nf: pd.DataFrame) ->
     )
 
     if res.df_boletos is None or res.df_boletos.empty:
-        # explica o motivo real quando o motor filtrou
         if getattr(res, "missing_clientes", None):
             return pd.DataFrame(), f"Cálculo filtrou UC(s): {res.missing_clientes} | motivo: {res.missing_reason}"
         return pd.DataFrame(), "Cálculo retornou vazio (sem missing_clientes). Investigar parse/medidores/itens."
@@ -192,6 +200,7 @@ def _calc_boleto_from_dfs(df_itens_nf: pd.DataFrame, df_med_nf: pd.DataFrame) ->
 # UI
 # -----------------------------------------------------------------------------
 tab_upload, tab_revisao, tab_historico = st.tabs(["📤 Upload", "🧮 Revisão + Lote", "📜 Histórico"])
+
 
 # =========================
 # TAB UPLOAD
@@ -300,17 +309,36 @@ with tab_revisao:
         st.stop()
 
     # Diagnóstico topo: bloqueadas x calculáveis
-    ucs = sorted(df_itens_all["unidade_consumidora"].dropna().astype(str).unique().tolist()) if "unidade_consumidora" in df_itens_all.columns else []
+    ucs = (
+        sorted(df_itens_all["unidade_consumidora"].dropna().astype(str).unique().tolist())
+        if "unidade_consumidora" in df_itens_all.columns
+        else []
+    )
     df_cli_all = _load_clientes_for_ucs(ucs)
 
     diag_rows = []
     for nf in nfs:
         df_it_nf_tmp = df_itens_all[df_itens_all["numero"].astype(str) == str(nf)]
-        uc_tmp = str(df_it_nf_tmp["unidade_consumidora"].dropna().iloc[0]) if "unidade_consumidora" in df_it_nf_tmp.columns and df_it_nf_tmp["unidade_consumidora"].notna().any() else ""
-        hit = df_cli_all[df_cli_all["unidade_consumidora"].astype(str) == uc_tmp] if (df_cli_all is not None and not df_cli_all.empty and uc_tmp) else pd.DataFrame()
-        cli_row = hit.iloc[0] if not hit.empty else None
-        motivo = _cadastro_motivo(cli_row)
-        diag_rows.append({"numero": str(nf), "unidade_consumidora": uc_tmp, "calculavel": motivo is None, "motivo": "" if motivo is None else motivo})
+        uc_tmp = (
+            str(df_it_nf_tmp["unidade_consumidora"].dropna().iloc[0])
+            if "unidade_consumidora" in df_it_nf_tmp.columns and df_it_nf_tmp["unidade_consumidora"].notna().any()
+            else ""
+        )
+        hit = (
+            df_cli_all[df_cli_all["unidade_consumidora"].astype(str) == uc_tmp]
+            if (df_cli_all is not None and not df_cli_all.empty and uc_tmp)
+            else pd.DataFrame()
+        )
+        cli_r = hit.iloc[0] if not hit.empty else None
+        motivo = _cadastro_motivo(cli_r)
+        diag_rows.append(
+            {
+                "numero": str(nf),
+                "unidade_consumidora": uc_tmp,
+                "calculavel": motivo is None,
+                "motivo": "" if motivo is None else motivo,
+            }
+        )
 
     df_diag = pd.DataFrame(diag_rows)
     bloqueadas = df_diag[~df_diag["calculavel"]]
@@ -331,12 +359,21 @@ with tab_revisao:
     st.markdown("---")
 
     # Botão lote
-    calc_lote = st.button("🧮 Calcular todas as NFs calculáveis do lote", type="primary", width="stretch", disabled=(len(ok) == 0))
+    calc_lote = st.button(
+        "🧮 Calcular todas as NFs calculáveis do lote",
+        type="primary",
+        width="stretch",
+        disabled=(len(ok) == 0),
+    )
     if calc_lote:
         falhas = []
         for nf in ok["numero"].tolist():
             df_it_nf = df_itens_all[df_itens_all["numero"].astype(str) == str(nf)].copy()
-            df_med_nf = df_med_all[df_med_all["nota_fiscal_numero"].astype(str) == str(nf)].copy() if not df_med_all.empty else pd.DataFrame()
+            df_med_nf = (
+                df_med_all[df_med_all["nota_fiscal_numero"].astype(str) == str(nf)].copy()
+                if not df_med_all.empty and "nota_fiscal_numero" in df_med_all.columns
+                else pd.DataFrame()
+            )
 
             df_calc, err = _calc_boleto_from_dfs(df_it_nf, df_med_nf)
             if err:
@@ -347,7 +384,7 @@ with tab_revisao:
         if falhas:
             st.warning(f"⚠️ {len(falhas)} NF(s) falharam no cálculo do lote.")
             st.dataframe(pd.DataFrame(falhas), hide_index=True, width="stretch")
-        st.success(f"✅ Lote calculado. Resultados disponíveis em 'NF selecionada' abaixo.")
+        st.success("✅ Lote calculado. Resultados disponíveis em 'NF selecionada' abaixo.")
 
     st.markdown("---")
 
@@ -355,44 +392,40 @@ with tab_revisao:
     nf_sel = st.selectbox("Selecione a NF para conferência", options=nfs)
 
     df_it_nf = df_itens_all[df_itens_all["numero"].astype(str) == str(nf_sel)].copy()
-    df_med_nf = df_med_all[df_med_all["nota_fiscal_numero"].astype(str) == str(nf_sel)].copy() if not df_med_all.empty else pd.DataFrame()
+    df_med_nf = (
+        df_med_all[df_med_all["nota_fiscal_numero"].astype(str) == str(nf_sel)].copy()
+        if not df_med_all.empty and "nota_fiscal_numero" in df_med_all.columns
+        else pd.DataFrame()
+    )
 
     if nf_sel in st.session_state.edited_itens:
         df_it_nf = st.session_state.edited_itens[nf_sel].copy()
     if nf_sel in st.session_state.edited_med:
         df_med_nf = st.session_state.edited_med[nf_sel].copy()
 
-    uc_now = str(df_it_nf["unidade_consumidora"].dropna().iloc[0]) if "unidade_consumidora" in df_it_nf.columns and df_it_nf["unidade_consumidora"].notna().any() else ""
+    uc_now = (
+        str(df_it_nf["unidade_consumidora"].dropna().iloc[0])
+        if "unidade_consumidora" in df_it_nf.columns and df_it_nf["unidade_consumidora"].notna().any()
+        else ""
+    )
 
     st.markdown(f"## 👤 Cadastro manual (info_clientes) — UC **{uc_now}**")
     df_cli_one = _load_cliente(uc_now) if uc_now else pd.DataFrame()
     cli_row = df_cli_one.iloc[0] if df_cli_one is not None and not df_cli_one.empty else None
 
-    classe_mod = str(df_it_nf["classe_modalidade"].dropna().iloc[0]) if "classe_modalidade" in df_it_nf.columns and df_it_nf["classe_modalidade"].notna().any() else ""
+    classe_mod = (
+        str(df_it_nf["classe_modalidade"].dropna().iloc[0])
+        if "classe_modalidade" in df_it_nf.columns and df_it_nf["classe_modalidade"].notna().any()
+        else ""
+    )
     n_sug = infer_n_fases(classe_mod) or 3
     custo_sug = int(compute_custo_disp(n_sug) or 100)
 
-    # --- BLOCO 1 (SUBSTITUIR) | correção NaN -> int/float sem crash ---
-
-    def _num_or_default(x, default: float) -> float:
-        v = pd.to_numeric(x, errors="coerce")
-        if pd.isna(v):
-            return float(default)
-        return float(v)
-
-    def _int_or_default(x, default: int) -> int:
-        v = pd.to_numeric(x, errors="coerce")
-        if pd.isna(v):
-            return int(default)
-        return int(round(float(v), 0))
-
-# valores atuais (se existirem) - SEM quebrar quando vier NaN
-desconto_cur = _num_or_default(cli_row.get("desconto_contratado") if cli_row is not None else None, 0.15)
-subv_cur = _num_or_default(cli_row.get("subvencao") if cli_row is not None else None, 0.0)
-status_cur = str((cli_row.get("status") if cli_row is not None else None) or "Ativo")
-
-n_cur = _int_or_default(cli_row.get("n_fases") if cli_row is not None else None, int(n_sug))
-custo_cur = _int_or_default(cli_row.get("custo_disp") if cli_row is not None else None, int(custo_sug))
+    desconto_cur = _num_or_default(cli_row.get("desconto_contratado") if cli_row is not None else None, 0.15)
+    subv_cur = _num_or_default(cli_row.get("subvencao") if cli_row is not None else None, 0.0)
+    status_cur = str((cli_row.get("status") if cli_row is not None else None) or "Ativo")
+    n_cur = _int_or_default(cli_row.get("n_fases") if cli_row is not None else None, int(n_sug))
+    custo_cur = _int_or_default(cli_row.get("custo_disp") if cli_row is not None else None, int(custo_sug))
 
     motivo = _cadastro_motivo(cli_row)
     if motivo is None:
@@ -403,7 +436,13 @@ custo_cur = _int_or_default(cli_row.get("custo_disp") if cli_row is not None els
     with st.form(f"form_cli_{uc_now}"):
         c1, c2, c3, c4, c5 = st.columns([1, 1, 1, 1, 1])
         with c1:
-            desconto = st.number_input("desconto_contratado", min_value=0.0, max_value=1.0, value=float(desconto_cur), step=0.01)
+            desconto = st.number_input(
+                "desconto_contratado",
+                min_value=0.0,
+                max_value=1.0,
+                value=float(desconto_cur),
+                step=0.01,
+            )
         with c2:
             subvencao = st.number_input("subvencao", min_value=0.0, value=float(subv_cur), step=50.0)
         with c3:
@@ -411,7 +450,11 @@ custo_cur = _int_or_default(cli_row.get("custo_disp") if cli_row is not None els
         with c4:
             custo_disp = st.number_input("custo_disp (INTEGER kWh)", min_value=0, value=int(custo_cur), step=10)
         with c5:
-            status = st.selectbox("status", options=["Ativo", "Inativo"], index=0 if str(status_cur).lower() == "ativo" else 1)
+            status = st.selectbox(
+                "status",
+                options=["Ativo", "Inativo"],
+                index=0 if str(status_cur).lower() == "ativo" else 1,
+            )
 
         salvar_cli = st.form_submit_button("💾 Salvar/Atualizar info_clientes")
 
@@ -422,7 +465,7 @@ custo_cur = _int_or_default(cli_row.get("custo_disp") if cli_row is not None els
                 "desconto_contratado": float(desconto),
                 "subvencao": float(subvencao),
                 "n_fases": int(n_fases),
-                "custo_disp": int(custo_disp),  # ✅ INTEGER
+                "custo_disp": int(custo_disp),  # INTEGER
                 "status": str(status),
                 "updated_at": datetime.utcnow(),
             }
@@ -433,7 +476,7 @@ custo_cur = _int_or_default(cli_row.get("custo_disp") if cli_row is not None els
 
     st.markdown("---")
 
-    # Revisão itens/medidores (mantém editável como você já tinha)
+    # Revisão itens/medidores
     st.markdown("## ✏️ Itens tarifários (editável)")
     editable_cols = [c for c in ["codigo", "descricao", "unidade", "quantidade_registrada", "tarifa", "valor"] if c in df_it_nf.columns]
     fixed_cols = [c for c in df_it_nf.columns if c not in editable_cols]
@@ -495,8 +538,14 @@ custo_cur = _int_or_default(cli_row.get("custo_disp") if cli_row is not None els
     if df_calc_show is not None and not df_calc_show.empty:
         row = df_calc_show.iloc[0].to_dict()
         st.markdown("## ✅ Resultado do cálculo (resumo)")
-        st.write(f"**Valor total boleto:** R$ {float(pd.to_numeric(row.get('valor_total_boleto'), errors='coerce') or 0.0):,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
-        st.write(f"**Base kWh (med_inj_tusd):** {float(pd.to_numeric(row.get('med_inj_tusd'), errors='coerce') or 0.0):,.0f}".replace(",", "X").replace(".", ",").replace("X", "."))
+        st.write(
+            f"**Valor total boleto:** R$ {float(pd.to_numeric(row.get('valor_total_boleto'), errors='coerce') or 0.0):,.2f}"
+            .replace(",", "X").replace(".", ",").replace("X", ".")
+        )
+        st.write(
+            f"**Base kWh (med_inj_tusd):** {float(pd.to_numeric(row.get('med_inj_tusd'), errors='coerce') or 0.0):,.0f}"
+            .replace(",", "X").replace(".", ",").replace("X", ".")
+        )
         st.write(f"**Check:** {row.get('check')}")
 
         with st.expander("Ver memorial completo (tabela)"):
@@ -514,7 +563,7 @@ custo_cur = _int_or_default(cli_row.get("custo_disp") if cli_row is not None els
         )
 
     if save_calc_btn:
-        df_calc_save = st.session_state.calc_por_nf.get(nf_sel)
+        df_calc_save = st.session_state.calc_por_nf.get(str(nf_sel))
         if df_calc_save is None or df_calc_save.empty:
             st.warning("Calcule primeiro.")
         else:
