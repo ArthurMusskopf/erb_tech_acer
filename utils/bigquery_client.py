@@ -1,6 +1,9 @@
 """
-ERB Tech - Cliente BigQuery
-VERSÃO v9 - casting por schema destino + upsert robusto
+ERB Tech - Cliente BigQuery (v9)
+- Query com parâmetros (inclui ARRAY via UNNEST)
+- Upsert com staging + MERGE
+- Auto-add de colunas ausentes (ALTER TABLE ADD COLUMN)
+- CAST do DataFrame conforme o schema destino (corrige custo_disp INTEGER no info_clientes)
 """
 
 from __future__ import annotations
@@ -13,7 +16,6 @@ import pandas as pd
 import streamlit as st
 from google.cloud import bigquery
 from google.oauth2 import service_account
-
 
 PROJECT_ID = "football-data-science"
 DATASET_ID = "erb_tech"
@@ -56,16 +58,12 @@ def _infer_bq_param(
 
 def execute_query(query: str, params: Optional[Dict[str, Any]] = None) -> pd.DataFrame:
     client = get_bigquery_client()
-
     if params:
         job_config = bigquery.QueryJobConfig(
             query_parameters=[_infer_bq_param(k, v) for k, v in params.items()]
         )
-        query_job = client.query(query, job_config=job_config)
-    else:
-        query_job = client.query(query)
-
-    return query_job.to_dataframe()
+        return client.query(query, job_config=job_config).to_dataframe()
+    return client.query(query).to_dataframe()
 
 
 def _ensure_string_dtype(series: pd.Series) -> pd.Series:
@@ -78,19 +76,18 @@ def _ensure_string_dtype(series: pd.Series) -> pd.Series:
 
 
 def normalize_for_bigquery(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Normalização leve: limpa strings e NaNs.
+    O CAST final é feito por schema destino em _cast_df_to_dest_schema.
+    """
     df = df.copy()
-
-    # strings comuns
     for c in df.columns:
         if df[c].dtype == object:
-            # não força tudo pra string (mantém datas/números se já vierem coerentes),
-            # mas limpa strings "nan"/vazio.
             try:
-                if pd.api.types.is_string_dtype(df[c]) or df[c].map(lambda x: isinstance(x, str) or x is None).all():
+                if df[c].map(lambda x: isinstance(x, str) or x is None).all():
                     df[c] = _ensure_string_dtype(df[c])
             except Exception:
                 pass
-
     return df.replace({np.nan: None})
 
 
@@ -143,30 +140,21 @@ def ensure_table_columns_from_df(table_id: str, df: pd.DataFrame) -> None:
     for c in missing:
         bq_type = _infer_bq_type_from_series(df[c]) if c in df.columns else "STRING"
         ddl = f"ALTER TABLE `{table_id}` ADD COLUMN `{c}` {bq_type}"
-        try:
-            client.query(ddl, location=LOCATION).result()
-        except Exception as e:
-            msg = str(e).lower()
-            if "already exists" in msg or "duplicate" in msg or "exists" in msg:
-                continue
-            raise
+        client.query(ddl, location=LOCATION).result()
 
 
 def _cast_df_to_dest_schema(df: pd.DataFrame, dest_schema_map: Dict[str, bigquery.SchemaField]) -> pd.DataFrame:
     """
-    Faz cast de cada coluna do df conforme o tipo no BigQuery.
-    Evita: custo_disp (INTEGER) chegando como float/string e virando NULL ou quebrando load.
+    CAST conforme schema destino (corrige custo_disp INT64 no info_clientes).
     """
     out = df.copy()
 
-    for col in list(out.columns):
+    for col in out.columns:
         if col not in dest_schema_map:
             continue
 
         f = dest_schema_map[col]
         t = (f.field_type or "").upper()
-
-        # NULL safe
         s = out[col]
 
         try:
@@ -174,7 +162,6 @@ def _cast_df_to_dest_schema(df: pd.DataFrame, dest_schema_map: Dict[str, bigquer
                 out[col] = _ensure_string_dtype(s)
 
             elif t in ("INT64", "INTEGER"):
-                # aceita float/string desde que seja inteiro "de verdade"
                 x = pd.to_numeric(s, errors="coerce")
                 x = x.round(0)
                 out[col] = x.astype("Int64")
@@ -189,23 +176,21 @@ def _cast_df_to_dest_schema(df: pd.DataFrame, dest_schema_map: Dict[str, bigquer
                     out[col] = s.where(pd.notna(s), None)
                 else:
                     x = s.astype(str).str.strip().str.lower()
-                    out[col] = x.map(lambda v: True if v in ("true", "1", "t", "yes", "y") else (False if v in ("false", "0", "f", "no", "n") else None))
+                    out[col] = x.map(
+                        lambda v: True if v in ("true", "1", "t", "yes", "y")
+                        else (False if v in ("false", "0", "f", "no", "n") else None)
+                    )
 
             elif t == "TIMESTAMP":
                 x = pd.to_datetime(s, errors="coerce", utc=True)
-                # BigQuery aceita datetime; manter como datetime64[ns, UTC]
                 out[col] = x.where(x.notna(), None)
 
             elif t == "DATE":
                 x = pd.to_datetime(s, errors="coerce").dt.date
                 out[col] = x.where(pd.notna(x), None)
 
-            else:
-                # fallback
-                out[col] = s.where(pd.notna(s), None)
-
         except Exception:
-            # não quebra por cast, mantém original
+            # se falhar cast, mantém original
             out[col] = s
 
     return out.replace({np.nan: None})
@@ -232,19 +217,16 @@ def upsert_dataframe(df: pd.DataFrame, table_id: str, key_column: str = "id") ->
     dest_table = client.get_table(table_id)
     dest_schema_map = {f.name: f for f in dest_table.schema}
 
-    # drop cols que não existem (caso DDL tenha falhado)
+    # drop cols que não existem (caso DDL falhe por permissão)
     missing_in_dest = [c for c in df_clean.columns if c not in dest_schema_map]
     if missing_in_dest:
         df_clean = df_clean[[c for c in df_clean.columns if c in dest_schema_map]].copy()
         if df_clean.empty:
-            raise ValueError(
-                f"Não foi possível alinhar o schema de {table_id}. "
-                f"Colunas faltantes: {missing_in_dest}"
-            )
+            raise ValueError(f"Schema de destino não contém nenhuma coluna do DF. Faltantes: {missing_in_dest}")
         dest_table = client.get_table(table_id)
         dest_schema_map = {f.name: f for f in dest_table.schema}
 
-    # ✅ cast final conforme schema destino
+    # ✅ cast pelo schema destino
     df_clean = _cast_df_to_dest_schema(df_clean, dest_schema_map)
 
     staging_schema = [dest_schema_map[c] for c in df_clean.columns]
@@ -255,13 +237,12 @@ def upsert_dataframe(df: pd.DataFrame, table_id: str, key_column: str = "id") ->
             write_disposition="WRITE_TRUNCATE",
         )
 
-        load_job = client.load_table_from_dataframe(
+        client.load_table_from_dataframe(
             df_clean,
             staging_table_id,
             location=LOCATION,
             job_config=job_config,
-        )
-        load_job.result()
+        ).result()
 
         cols = list(df_clean.columns)
         non_key_cols = [c for c in cols if c != key_column]
