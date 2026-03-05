@@ -20,6 +20,7 @@ import hashlib
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, Any, Tuple, Optional, List
+from utils.boletos_adapter import calc_to_boletos_schema
 
 import pandas as pd
 import streamlit as st
@@ -109,7 +110,7 @@ def _delete_nf_from_bigquery(nf: str) -> None:
     )
     client.query(f"DELETE FROM `{TABLE_FATURA_ITENS}` WHERE numero = @nf", job_config=cfg).result()
     client.query(f"DELETE FROM `{TABLE_MEDIDORES}` WHERE nota_fiscal_numero = @nf", job_config=cfg).result()
-    # boletos_calculados usa id/nota_fiscal
+    # boletos_calculados: sua chave é id / nota_fiscal
     client.query(f"DELETE FROM `{TABLE_BOLETOS}` WHERE id = @nf OR nota_fiscal = @nf", job_config=cfg).result()
 
 
@@ -148,15 +149,27 @@ def _calc_boleto_from_dfs(df_itens_nf: pd.DataFrame, df_med_nf: pd.DataFrame) ->
     if df_itens_nf is None or df_itens_nf.empty:
         return pd.DataFrame(), "Sem itens para calcular."
 
-    uc = str(df_itens_nf["unidade_consumidora"].dropna().iloc[0]) if "unidade_consumidora" in df_itens_nf.columns and df_itens_nf["unidade_consumidora"].notna().any() else ""
+    uc = ""
+    if "unidade_consumidora" in df_itens_nf.columns and df_itens_nf["unidade_consumidora"].notna().any():
+        uc = str(df_itens_nf["unidade_consumidora"].dropna().iloc[0]).strip()
     if not uc:
         return pd.DataFrame(), "UC ausente nos itens."
 
     df_cli = _load_cliente(uc)
-    cli_row = df_cli.iloc[0] if df_cli is not None and not df_cli.empty else None
-    motivo = _cadastro_motivo(cli_row)
-    if motivo is not None:
-        return pd.DataFrame(), f"Cadastro insuficiente (info_clientes): {motivo}"
+    if df_cli is None or df_cli.empty:
+        return pd.DataFrame(), f"UC {uc} não cadastrada em info_clientes."
+
+    # valida cadastro mínimo antes de chamar o motor
+    row = df_cli.iloc[0].to_dict()
+    if pd.isna(row.get("desconto_contratado")):
+        return pd.DataFrame(), f"Cadastro incompleto (info_clientes): desconto_contratado vazio para UC {uc}"
+    if pd.isna(row.get("custo_disp")):
+        return pd.DataFrame(), f"Cadastro incompleto (info_clientes): custo_disp vazio para UC {uc}"
+    stt = str(row.get("status") or "").strip().lower()
+    if not stt:
+        return pd.DataFrame(), f"Cadastro incompleto (info_clientes): status vazio para UC {uc}"
+    if stt != "ativo":
+        return pd.DataFrame(), f"Cliente com status '{row.get('status')}'. Ajuste para 'Ativo' para calcular."
 
     res = calculate_boletos(
         df_itens=df_itens_nf,
@@ -165,10 +178,13 @@ def _calc_boleto_from_dfs(df_itens_nf: pd.DataFrame, df_med_nf: pd.DataFrame) ->
         only_registered_clients=True,
         only_status_ativo=True,
     )
+
     if res.df_boletos is None or res.df_boletos.empty:
-        if res.missing_clientes:
-            return pd.DataFrame(), f"Cálculo filtrou UC(s): {res.missing_clientes} | {res.missing_reason}"
-        return pd.DataFrame(), "Cálculo retornou vazio (investigar parse/medidores/itens)."
+        # explica o motivo real quando o motor filtrou
+        if getattr(res, "missing_clientes", None):
+            return pd.DataFrame(), f"Cálculo filtrou UC(s): {res.missing_clientes} | motivo: {res.missing_reason}"
+        return pd.DataFrame(), "Cálculo retornou vazio (sem missing_clientes). Investigar parse/medidores/itens."
+
     return res.df_boletos, None
 
 
@@ -482,13 +498,14 @@ with tab_revisao:
         )
 
     if save_calc_btn:
-        df_calc_save = st.session_state.calc_por_nf.get(str(nf_sel))
+        df_calc_save = st.session_state.calc_por_nf.get(nf_sel)
         if df_calc_save is None or df_calc_save.empty:
             st.warning("Calcule primeiro.")
         else:
             try:
-                df_bq = calc_to_boletos_schema(df_calc_save, df_it_edit, status="calculado")
-                upsert_dataframe(df_bq, TABLE_BOLETOS, key_column="id")
+                with st.spinner("Salvando cálculo em boletos_calculados (schema correto)..."):
+                    df_bq = calc_to_boletos_schema(df_calc_save, df_it_edit, status="calculado")
+                    upsert_dataframe(df_bq, TABLE_BOLETOS, key_column="id")
                 st.success("✅ Cálculo salvo em boletos_calculados.")
             except Exception as e:
                 st.error(f"Falha ao salvar cálculo: {e}")
