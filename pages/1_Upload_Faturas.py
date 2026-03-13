@@ -299,70 +299,165 @@ with tab_upload:
 
     if uploaded_files and st.button("🚀 Processar Faturas", type="primary", width="stretch"):
         with tempfile.TemporaryDirectory() as temp_dir:
-            pdf_paths = []
+        pdf_paths = []
+        arquivo_hash_by_name = _build_hash_by_filename(uploaded_files)
 
-            for uploaded_file in uploaded_files:
-                if uploaded_file.name.lower().endswith(".zip"):
-                    zip_path = os.path.join(temp_dir, uploaded_file.name)
-                    with open(zip_path, "wb") as f:
-                        f.write(uploaded_file.getbuffer())
+        for uploaded_file in uploaded_files:
+            if uploaded_file.name.lower().endswith(".zip"):
+                zip_path = os.path.join(temp_dir, uploaded_file.name)
+                with open(zip_path, "wb") as f:
+                    f.write(uploaded_file.getbuffer())
 
-                    with zipfile.ZipFile(zip_path, "r") as zip_ref:
-                        zip_ref.extractall(temp_dir)
+                with zipfile.ZipFile(zip_path, "r") as zip_ref:
+                    zip_ref.extractall(temp_dir)
 
-                    for root, _, files in os.walk(temp_dir):
-                        for file in files:
-                            if file.lower().endswith(".pdf"):
-                                pdf_paths.append(os.path.join(root, file))
-                else:
-                    pdf_path = os.path.join(temp_dir, uploaded_file.name)
-                    with open(pdf_path, "wb") as f:
-                        f.write(uploaded_file.getbuffer())
-                    pdf_paths.append(pdf_path)
-
-            if not pdf_paths:
-                st.error("Nenhum PDF encontrado!")
+                for root, _, files in os.walk(temp_dir):
+                    for file in files:
+                        if file.lower().endswith(".pdf"):
+                            pdf_paths.append(os.path.join(root, file))
             else:
-                progress_bar = st.progress(0)
-                status_text = st.empty()
+                pdf_path = os.path.join(temp_dir, uploaded_file.name)
+                with open(pdf_path, "wb") as f:
+                    f.write(uploaded_file.getbuffer())
+                pdf_paths.append(pdf_path)
 
-                def update_progress(progress, arquivo):
-                    progress_bar.progress(progress)
-                    status_text.text(f"Processando: {arquivo}")
+        if not pdf_paths:
+            st.error("Nenhum PDF encontrado!")
+        else:
+            progress_bar = st.progress(0)
+            status_text = st.empty()
 
-                with st.spinner("Processando..."):
-                    resultado = processar_lote_faturas(pdf_paths, update_progress)
+            def update_progress(progress, arquivo):
+                progress_bar.progress(progress)
+                status_text.text(f"Processando: {arquivo}")
 
-                progress_bar.progress(1.0)
-                status_text.empty()
+            with st.spinner("Processando..."):
+                resultado = processar_lote_faturas(pdf_paths, update_progress)
 
-                c1, c2, c3 = st.columns(3)
-                c1.metric("Total", resultado["total"])
-                c2.metric("Sucesso", resultado["sucesso"])
-                c3.metric("Erros", resultado["erros"])
+            progress_bar.progress(1.0)
+            status_text.empty()
 
-                erros_lista = [r for r in resultado["resultados"] if not r.sucesso]
-                if erros_lista:
-                    with st.expander(f"⚠️ {len(erros_lista)} arquivo(s) com erro"):
-                        for r in erros_lista:
-                            st.error(f"**{r.arquivo}**: {', '.join(r.erros)}")
+            # métricas básicas do parse
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Arquivos no lote", resultado["total"])
+            c2.metric("Parseadas com sucesso", resultado["sucesso"])
+            c3.metric("Erros de parse", resultado["erros"])
 
-                if not resultado["df_itens"].empty:
-                    st.session_state.faturas_processadas = resultado
-                    st.success(f"✅ {len(resultado['df_itens'])} itens parseados!")
+            erros_lista = [r for r in resultado["resultados"] if not r.sucesso]
+            if erros_lista:
+                with st.expander(f"⚠️ {len(erros_lista)} arquivo(s) com erro"):
+                    for r in erros_lista:
+                        st.error(f"**{r.arquivo}**: {', '.join(r.erros)}")
 
-                    if salvar_auto:
-                        try:
-                            with st.spinner("Salvando no BigQuery..."):
-                                n_itens = upsert_dataframe(resultado["df_itens"], TABLE_FATURA_ITENS, "id")
-                                n_med = (
-                                    upsert_dataframe(resultado["df_medidores"], TABLE_MEDIDORES, "id")
-                                    if not resultado["df_medidores"].empty
-                                    else 0
-                                )
-                            st.success(f"✅ Salvo: {n_itens} itens, {n_med} medidores")
-                        except Exception as e:
-                            st.error(f"Erro ao salvar: {e}")
+            if not resultado["df_itens"].empty:
+                # guarda em sessão
+                st.session_state.faturas_processadas = resultado
+
+                # monta workflow do lote
+                nfs_lote = (
+                    resultado["df_itens"]["numero"]
+                    .dropna()
+                    .astype(str)
+                    .unique()
+                    .tolist()
+                    if "numero" in resultado["df_itens"].columns
+                    else []
+                )
+
+                existing_workflow_df = _load_existing_workflow_by_nfs(nfs_lote)
+                df_workflow_lote = build_workflow_from_parse_results(
+                    resultado["resultados"],
+                    existing_workflow_df=existing_workflow_df,
+                    arquivo_hash_by_name=arquivo_hash_by_name,
+                    pdf_uri_by_name={},  # GCS entra em etapa posterior
+                )
+
+                st.session_state["workflow_lote"] = df_workflow_lote.copy()
+
+                resumo = _summarize_workflow_status(df_workflow_lote)
+
+                st.markdown("### 📌 Classificação do lote")
+                k1, k2, k3, k4 = st.columns(4)
+                k1.metric("NFs identificadas", resumo["total_nf"])
+                k2.metric("Inéditas", resumo["ineditas"])
+                k3.metric("Já existentes", resumo["repetidas"])
+                k4.metric("Parse com erro", resumo["erro_parse"])
+
+                st.markdown("### 🧾 Cabeçalhos do lote (workflow)")
+                if df_workflow_lote is not None and not df_workflow_lote.empty:
+                    cols_show = [
+                        "id",
+                        "unidade_consumidora",
+                        "cliente_numero",
+                        "nome",
+                        "referencia",
+                        "vencimento",
+                        "total_pagar",
+                        "is_inedita",
+                        "status_parse",
+                        "arquivo_nome_original",
+                    ]
+                    cols_show = [c for c in cols_show if c in df_workflow_lote.columns]
+                    st.dataframe(
+                        df_workflow_lote[cols_show].sort_values(["referencia", "id"], ascending=[False, False]),
+                        hide_index=True,
+                        width="stretch",
+                    )
+
+                    repetidas = df_workflow_lote[df_workflow_lote["is_inedita"] == False].copy()
+                    if not repetidas.empty:
+                        with st.expander("Ver NFs já existentes"):
+                            st.dataframe(
+                                repetidas[[c for c in cols_show if c in repetidas.columns]],
+                                hide_index=True,
+                                width="stretch",
+                            )
+
+                st.success(f"✅ {len(resultado['df_itens'])} itens parseados!")
+
+                if salvar_auto:
+                    try:
+                        with st.spinner("Salvando no BigQuery..."):
+                            # workflow sempre salva (inclusive repetidas, para rastreabilidade do lote)
+                            n_wf = upsert_dataframe(df_workflow_lote, TABLE_FATURAS_WORKFLOW, "id")
+
+                            # itens/medidores: salvar apenas NFs inéditas
+                            nfs_ineditas = (
+                                df_workflow_lote[df_workflow_lote["is_inedita"] == True]["id"]
+                                .dropna()
+                                .astype(str)
+                                .tolist()
+                            )
+
+                            if nfs_ineditas:
+                                df_itens_save = resultado["df_itens"][
+                                    resultado["df_itens"]["numero"].astype(str).isin(nfs_ineditas)
+                                ].copy()
+
+                                if resultado["df_medidores"] is not None and not resultado["df_medidores"].empty:
+                                    df_med_save = resultado["df_medidores"][
+                                        resultado["df_medidores"]["nota_fiscal_numero"].astype(str).isin(nfs_ineditas)
+                                    ].copy()
+                                else:
+                                    df_med_save = pd.DataFrame()
+
+                                n_itens = upsert_dataframe(df_itens_save, TABLE_FATURA_ITENS, "id") if not df_itens_save.empty else 0
+                                n_med = upsert_dataframe(df_med_save, TABLE_MEDIDORES, "id") if not df_med_save.empty else 0
+                            else:
+                                n_itens = 0
+                                n_med = 0
+
+                        if resumo["repetidas"] > 0:
+                            st.warning(
+                                f"⚠️ Workflow salvo ({n_wf} linhas). "
+                                f"Itens/medidores salvos apenas para NFs inéditas: {resumo['ineditas']} inéditas, {resumo['repetidas']} já existentes."
+                            )
+
+                        st.success(
+                            f"✅ BigQuery atualizado: workflow={n_wf}, itens={n_itens}, medidores={n_med}"
+                        )
+                    except Exception as e:
+                        st.error(f"Erro ao salvar: {e}")
 
 
 # =========================
