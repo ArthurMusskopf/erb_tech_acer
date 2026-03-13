@@ -6,6 +6,7 @@ Objetivo desta versão:
 - Exibir KPIs e EDA básica das faturas parseadas
 - Mostrar tabela principal com status de validação/cálculo/emissão
 - Permitir validar a NF, ajustar info_clientes e calcular a NF selecionada
+- Permitir validação em massa da fila filtrada ou selecionada
 - Exibir memorial e exportar Excel
 
 Observações:
@@ -257,6 +258,7 @@ def _motivo_from_row(r: pd.Series) -> str:
 df_diag["motivo_bloqueio"] = df_diag.apply(_motivo_from_row, axis=1)
 df_diag["calculavel"] = df_diag["motivo_bloqueio"].eq("")
 
+
 # -----------------------------------------------------------------------------
 # KPIs e EDA básica
 # -----------------------------------------------------------------------------
@@ -375,6 +377,100 @@ st.markdown("---")
 
 
 # -----------------------------------------------------------------------------
+# Validação em massa
+# -----------------------------------------------------------------------------
+st.markdown("## ✅ Validação em massa")
+
+nfs_filtradas = df_fila["id"].dropna().astype(str).tolist()
+nfs_calculaveis_filtradas = (
+    df_fila[df_fila["calculavel"] == True]["id"].dropna().astype(str).tolist()
+)
+
+nfs_selecionadas = st.multiselect(
+    "Selecione NFs para ação em massa",
+    options=nfs_filtradas,
+    default=[],
+)
+
+b1, b2, b3 = st.columns(3)
+validar_todas_btn = b1.button(
+    f"✅ Validar todas as calculáveis filtradas ({len(nfs_calculaveis_filtradas)})",
+    width="stretch",
+)
+validar_sel_btn = b2.button(
+    f"✅ Validar selecionadas ({len(nfs_selecionadas)})",
+    width="stretch",
+    disabled=(len(nfs_selecionadas) == 0),
+)
+pendente_sel_btn = b3.button(
+    f"⏳ Marcar selecionadas como pendente ({len(nfs_selecionadas)})",
+    width="stretch",
+    disabled=(len(nfs_selecionadas) == 0),
+)
+
+if validar_todas_btn:
+    try:
+        for nf in nfs_calculaveis_filtradas:
+            _upsert_workflow_status(
+                str(nf),
+                status_validacao="validada",
+                validado_por="app_boletos_massa",
+                validado_em=_now_utc(),
+                observacoes_append="validacao_em_massa_tela_2",
+            )
+        st.success(f"✅ {len(nfs_calculaveis_filtradas)} NF(s) calculáveis foram validadas.")
+        st.cache_data.clear()
+        st.rerun()
+    except Exception as e:
+        st.error(f"Falha na validação em massa: {e}")
+
+if validar_sel_btn:
+    try:
+        validadas = 0
+        puladas = []
+        for nf in nfs_selecionadas:
+            row_nf = df_fila[df_fila["id"].astype(str) == str(nf)]
+            if row_nf.empty:
+                continue
+            row_nf = row_nf.iloc[0]
+            if bool(row_nf.get("calculavel")):
+                _upsert_workflow_status(
+                    str(nf),
+                    status_validacao="validada",
+                    validado_por="app_boletos_massa",
+                    validado_em=_now_utc(),
+                    observacoes_append="validacao_selecionadas_tela_2",
+                )
+                validadas += 1
+            else:
+                puladas.append(str(nf))
+
+        if puladas:
+            st.warning(f"⚠️ {len(puladas)} NF(s) foram puladas por cadastro incompleto: {', '.join(puladas[:10])}")
+        st.success(f"✅ {validadas} NF(s) selecionadas foram validadas.")
+        st.cache_data.clear()
+        st.rerun()
+    except Exception as e:
+        st.error(f"Falha ao validar selecionadas: {e}")
+
+if pendente_sel_btn:
+    try:
+        for nf in nfs_selecionadas:
+            _upsert_workflow_status(
+                str(nf),
+                status_validacao="pendente",
+                observacoes_append="retorno_para_pendente_em_massa_tela_2",
+            )
+        st.info(f"ℹ️ {len(nfs_selecionadas)} NF(s) voltaram para PENDENTE.")
+        st.cache_data.clear()
+        st.rerun()
+    except Exception as e:
+        st.error(f"Falha ao atualizar selecionadas: {e}")
+
+st.markdown("---")
+
+
+# -----------------------------------------------------------------------------
 # Seleção NF
 # -----------------------------------------------------------------------------
 df_fila["label"] = df_fila.apply(
@@ -417,11 +513,9 @@ if motivo is None:
 else:
     st.error(f"Cadastro insuficiente para cálculo: **{motivo}**")
 
-# sugestões para ajudar preenchimento
 n_sug = infer_n_fases(classe_mod) or 3
 custo_sug = int(compute_custo_disp(n_sug) or 100)
 
-# valores atuais (NAN-safe)
 desconto_cur = _num_or_default(cli_row.get("desconto_contratado") if cli_row is not None else None, 0.15)
 subv_cur = _num_or_default(cli_row.get("subvencao") if cli_row is not None else None, 0.0)
 status_cur = str((cli_row.get("status") if cli_row is not None else None) or "Ativo")
