@@ -7,6 +7,8 @@ Objetivo desta versão:
 - Mostrar tabela principal com status de validação/cálculo/emissão
 - Permitir validar a NF, ajustar info_clientes e calcular a NF selecionada
 - Permitir validação em massa da fila filtrada ou selecionada
+- Permitir cálculo em massa e individual, salvando em boletos_calculados
+- Permitir emissão placeholder em massa e individual
 - Exibir memorial e exportar Excel
 
 Observações:
@@ -35,8 +37,10 @@ from utils.bigquery_client import (
     TABLE_MEDIDORES,
     TABLE_CLIENTES,
     TABLE_FATURAS_WORKFLOW,
+    TABLE_BOLETOS,
 )
 from utils.calc_engine import calculate_boletos, infer_n_fases, compute_custo_disp
+from utils.boletos_adapter import calc_to_boletos_schema
 
 st.set_page_config(page_title="Boletos - ERB Tech", page_icon="💰", layout="wide")
 st.title("💰 Boletos / Fila operacional")
@@ -157,6 +161,45 @@ def _upsert_workflow_status(
     upsert_dataframe(pd.DataFrame([row]), TABLE_FATURAS_WORKFLOW, key_column="id")
 
 
+def _upsert_boleto_status(nf: str, status: str) -> None:
+    """
+    Atualiza status em boletos_calculados sem perder os demais campos.
+    """
+    if not nf:
+        return
+
+    q = f"""
+    SELECT *
+    FROM `{TABLE_BOLETOS}`
+    WHERE id = @nf
+    LIMIT 1
+    """
+    df_current = execute_query(q, {"nf": str(nf)})
+    if df_current is None or df_current.empty:
+        return
+
+    row = df_current.iloc[0].to_dict()
+    row["status"] = status
+    row["updated_at"] = _now_utc()
+    upsert_dataframe(pd.DataFrame([row]), TABLE_BOLETOS, key_column="id")
+
+
+def _save_calc_to_bigquery(nf: str, df_calc: pd.DataFrame, df_it: pd.DataFrame) -> None:
+    """
+    Salva o cálculo normalizado em boletos_calculados e sincroniza o workflow.
+    """
+    if df_calc is None or df_calc.empty:
+        return
+
+    df_bq = calc_to_boletos_schema(df_calc, df_it, status="calculado")
+    upsert_dataframe(df_bq, TABLE_BOLETOS, key_column="id")
+    _upsert_workflow_status(
+        str(nf),
+        status_calculo="calculada",
+        calculado_em=_now_utc(),
+    )
+
+
 # -----------------------------------------------------------------------------
 # BigQuery loads
 # -----------------------------------------------------------------------------
@@ -223,6 +266,39 @@ def load_cliente(uc: str) -> pd.DataFrame:
     return execute_query(q, {"uc": str(uc)})
 
 
+@st.cache_data(ttl=60, show_spinner=False)
+def load_calculated_queue(limit: int = 1000) -> pd.DataFrame:
+    q = f"""
+    SELECT
+        id,
+        nota_fiscal,
+        unidade_consumidora,
+        cliente_numero,
+        nome,
+        periodo,
+        consumo_kwh,
+        injetada_kwh,
+        desconto_contratado,
+        valor_final,
+        status,
+        validado_por,
+        validado_em,
+        created_at,
+        updated_at
+    FROM `{TABLE_BOLETOS}`
+    ORDER BY COALESCE(updated_at, created_at) DESC
+    LIMIT {int(limit)}
+    """
+    return execute_query(q)
+
+
+# -----------------------------------------------------------------------------
+# Estado local de memorial
+# -----------------------------------------------------------------------------
+if "calc_nf" not in st.session_state:
+    st.session_state.calc_nf = {}
+
+
 # -----------------------------------------------------------------------------
 # Fila do workflow
 # -----------------------------------------------------------------------------
@@ -260,7 +336,7 @@ df_diag["calculavel"] = df_diag["motivo_bloqueio"].eq("")
 
 
 # -----------------------------------------------------------------------------
-# KPIs e EDA básica
+# KPIs e EDA básica do parseado
 # -----------------------------------------------------------------------------
 total_faturas = len(df_diag)
 total_clientes = int(df_diag["cliente_numero"].nunique()) if "cliente_numero" in df_diag.columns else 0
@@ -290,9 +366,7 @@ with st.expander("📊 EDA básica dos dados parseados"):
         "Faturas calculáveis (cadastro OK)": int(df_diag["calculavel"].sum()),
         "Faturas bloqueadas por cadastro": int((~df_diag["calculavel"]).sum()),
     }
-    resumo_df = pd.DataFrame(
-        {"indicador": list(resumo.keys()), "valor": list(resumo.values())}
-    )
+    resumo_df = pd.DataFrame({"indicador": list(resumo.keys()), "valor": list(resumo.values())})
     st.dataframe(resumo_df, hide_index=True, width="stretch")
 
     if "cliente_numero" in df_diag.columns and "unidade_consumidora" in df_diag.columns:
@@ -382,9 +456,7 @@ st.markdown("---")
 st.markdown("## ✅ Validação em massa")
 
 nfs_filtradas = df_fila["id"].dropna().astype(str).tolist()
-nfs_calculaveis_filtradas = (
-    df_fila[df_fila["calculavel"] == True]["id"].dropna().astype(str).tolist()
-)
+nfs_calculaveis_filtradas = df_fila[df_fila["calculavel"] == True]["id"].dropna().astype(str).tolist()
 
 nfs_selecionadas = st.multiselect(
     "Selecione NFs para ação em massa",
@@ -466,6 +538,184 @@ if pendente_sel_btn:
         st.rerun()
     except Exception as e:
         st.error(f"Falha ao atualizar selecionadas: {e}")
+
+st.markdown("---")
+
+
+# -----------------------------------------------------------------------------
+# Cálculo e emissão em massa
+# -----------------------------------------------------------------------------
+st.markdown("## 🧮 Cálculo e emissão em massa")
+
+nfs_validadas_filtradas = (
+    df_fila[
+        (df_fila["status_validacao"].astype(str) == "validada")
+        & (df_fila["calculavel"] == True)
+    ]["id"]
+    .dropna()
+    .astype(str)
+    .tolist()
+)
+
+nfs_calculadas_filtradas = (
+    df_fila[df_fila["status_calculo"].astype(str) == "calculada"]["id"]
+    .dropna()
+    .astype(str)
+    .tolist()
+)
+
+c1, c2, c3 = st.columns(3)
+calc_todas_btn = c1.button(
+    f"🧮 Calcular todas as validadas filtradas ({len(nfs_validadas_filtradas)})",
+    type="primary",
+    width="stretch",
+)
+calc_sel_btn = c2.button(
+    f"🧮 Calcular selecionadas ({len(nfs_selecionadas)})",
+    width="stretch",
+    disabled=(len(nfs_selecionadas) == 0),
+)
+emitir_sel_btn = c3.button(
+    f"🧾 Marcar selecionadas como emitidas ({len(nfs_selecionadas)})",
+    width="stretch",
+    disabled=(len(nfs_selecionadas) == 0),
+)
+
+if calc_todas_btn:
+    try:
+        ok_count = 0
+        erros = []
+        for nf in nfs_validadas_filtradas:
+            row_nf = df_fila[df_fila["id"].astype(str) == str(nf)].iloc[0]
+            uc_nf = str(row_nf["unidade_consumidora"])
+
+            df_it, df_med = load_invoice_data(str(nf))
+            df_cli = load_cliente(uc_nf)
+
+            if df_it is None or df_it.empty:
+                erro = "NF sem itens em fatura_itens."
+                erros.append({"nf": nf, "erro": erro})
+                _upsert_workflow_status(str(nf), status_calculo="erro_calculo", calculado_em=_now_utc(), observacoes_append=erro)
+                continue
+
+            res = calculate_boletos(df_itens=df_it, df_medidores=df_med, df_clientes=df_cli)
+            if res.df_boletos is None or res.df_boletos.empty:
+                erro = getattr(res, "missing_reason", "Cálculo vazio")
+                erros.append({"nf": nf, "erro": erro})
+                _upsert_workflow_status(str(nf), status_calculo="erro_calculo", calculado_em=_now_utc(), observacoes_append=f"erro_calculo_massa: {erro}")
+                continue
+
+            _save_calc_to_bigquery(str(nf), res.df_boletos, df_it)
+            ok_count += 1
+
+        if erros:
+            st.warning(f"⚠️ {len(erros)} NF(s) falharam no cálculo em massa.")
+            st.dataframe(pd.DataFrame(erros), hide_index=True, width="stretch")
+
+        st.success(f"✅ {ok_count} NF(s) calculadas e salvas em boletos_calculados.")
+        st.cache_data.clear()
+        st.rerun()
+    except Exception as e:
+        st.error(f"Falha no cálculo em massa: {e}")
+
+if calc_sel_btn:
+    try:
+        ok_count = 0
+        erros = []
+        for nf in nfs_selecionadas:
+            row_nf_df = df_fila[df_fila["id"].astype(str) == str(nf)]
+            if row_nf_df.empty:
+                continue
+
+            row_nf = row_nf_df.iloc[0]
+            if not (str(row_nf.get("status_validacao") or "") == "validada" and bool(row_nf.get("calculavel"))):
+                erros.append({"nf": nf, "erro": "NF não validada ou com cadastro incompleto"})
+                continue
+
+            uc_nf = str(row_nf["unidade_consumidora"])
+            df_it, df_med = load_invoice_data(str(nf))
+            df_cli = load_cliente(uc_nf)
+
+            if df_it is None or df_it.empty:
+                erro = "NF sem itens em fatura_itens."
+                erros.append({"nf": nf, "erro": erro})
+                _upsert_workflow_status(str(nf), status_calculo="erro_calculo", calculado_em=_now_utc(), observacoes_append=erro)
+                continue
+
+            res = calculate_boletos(df_itens=df_it, df_medidores=df_med, df_clientes=df_cli)
+            if res.df_boletos is None or res.df_boletos.empty:
+                erro = getattr(res, "missing_reason", "Cálculo vazio")
+                erros.append({"nf": nf, "erro": erro})
+                _upsert_workflow_status(str(nf), status_calculo="erro_calculo", calculado_em=_now_utc(), observacoes_append=f"erro_calculo_selecionadas: {erro}")
+                continue
+
+            _save_calc_to_bigquery(str(nf), res.df_boletos, df_it)
+            ok_count += 1
+
+        if erros:
+            st.warning(f"⚠️ {len(erros)} NF(s) não foram calculadas.")
+            st.dataframe(pd.DataFrame(erros), hide_index=True, width="stretch")
+
+        st.success(f"✅ {ok_count} NF(s) selecionadas foram calculadas e salvas.")
+        st.cache_data.clear()
+        st.rerun()
+    except Exception as e:
+        st.error(f"Falha ao calcular selecionadas: {e}")
+
+if emitir_sel_btn:
+    try:
+        emitidas = 0
+        puladas = []
+        for nf in nfs_selecionadas:
+            row_nf_df = df_fila[df_fila["id"].astype(str) == str(nf)]
+            if row_nf_df.empty:
+                continue
+            row_nf = row_nf_df.iloc[0]
+
+            if str(row_nf.get("status_calculo") or "") != "calculada":
+                puladas.append(str(nf))
+                continue
+
+            _upsert_workflow_status(
+                str(nf),
+                status_emissao="emitido",
+                emitido_em=_now_utc(),
+                observacoes_append="emissao_placeholder_tela_2",
+            )
+            _upsert_boleto_status(str(nf), "emitido")
+            emitidas += 1
+
+        if puladas:
+            st.warning(f"⚠️ {len(puladas)} NF(s) foram puladas por ainda não estarem calculadas: {', '.join(puladas[:10])}")
+
+        st.success(f"✅ {emitidas} NF(s) marcadas como emitidas.")
+        st.cache_data.clear()
+        st.rerun()
+    except Exception as e:
+        st.error(f"Falha ao marcar emissão: {e}")
+
+st.markdown("---")
+
+
+# -----------------------------------------------------------------------------
+# Base de cálculos salvos
+# -----------------------------------------------------------------------------
+st.markdown("## 📦 Base de cálculos salvos")
+
+df_calc_base = load_calculated_queue()
+
+if df_calc_base is not None and not df_calc_base.empty:
+    valor_final_num = pd.to_numeric(df_calc_base.get("valor_final"), errors="coerce")
+    d1, d2, d3, d4 = st.columns(4)
+    d1.metric("Registros calculados", len(df_calc_base))
+    d2.metric("Clientes calculados", int(df_calc_base["cliente_numero"].nunique()) if "cliente_numero" in df_calc_base.columns else 0)
+    d3.metric("UCs calculadas", int(df_calc_base["unidade_consumidora"].nunique()) if "unidade_consumidora" in df_calc_base.columns else 0)
+    d4.metric("Valor total calculado", "R$ " + f"{float(valor_final_num.fillna(0).sum()):,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
+
+    with st.expander("Ver tabela de calculados"):
+        st.dataframe(df_calc_base, hide_index=True, width="stretch")
+else:
+    st.info("Nenhum cálculo salvo em boletos_calculados até o momento.")
 
 st.markdown("---")
 
@@ -578,9 +828,10 @@ st.markdown("---")
 # -----------------------------------------------------------------------------
 st.markdown("## ✅ Ações da fatura")
 
-a1, a2 = st.columns([1, 1])
+a1, a2, a3 = st.columns([1, 1, 1])
 validar_btn = a1.button("✅ Validar dados desta NF", width="stretch")
 manter_pendente_btn = a2.button("⏳ Manter como pendente", width="stretch")
+emitir_btn = a3.button("🧾 Marcar esta NF como emitida", width="stretch", disabled=(status_calculo_nf != "calculada"))
 
 if validar_btn:
     try:
@@ -610,6 +861,21 @@ if manter_pendente_btn:
     except Exception as e:
         st.error(f"Falha ao atualizar workflow: {e}")
 
+if emitir_btn:
+    try:
+        _upsert_workflow_status(
+            str(nf_sel),
+            status_emissao="emitido",
+            emitido_em=_now_utc(),
+            observacoes_append="emissao_placeholder_individual_tela_2",
+        )
+        _upsert_boleto_status(str(nf_sel), "emitido")
+        st.success(f"✅ NF {nf_sel} marcada como EMITIDA.")
+        st.cache_data.clear()
+        st.rerun()
+    except Exception as e:
+        st.error(f"Falha ao marcar emissão: {e}")
+
 st.markdown("---")
 
 
@@ -625,9 +891,6 @@ if _cadastro_motivo(cli_row) is not None:
     st.info("Preencha e salve o cadastro mínimo acima para habilitar o cálculo.")
 elif status_validacao_nf != "validada":
     st.info("Valide a NF antes de calcular. O cálculo nesta etapa é liberado apenas para faturas validadas.")
-
-if "calc_nf" not in st.session_state:
-    st.session_state.calc_nf = {}
 
 if calc_btn:
     df_it, df_med = load_invoice_data(nf_sel)
@@ -654,12 +917,8 @@ if calc_btn:
                     st.error("Cálculo retornou vazio. Investigar parse/medidores/itens.")
             else:
                 st.session_state.calc_nf[nf_sel] = res.df_boletos.copy()
-                _upsert_workflow_status(
-                    str(nf_sel),
-                    status_calculo="calculada",
-                    calculado_em=_now_utc(),
-                )
-                st.success("✅ Cálculo concluído.")
+                _save_calc_to_bigquery(str(nf_sel), res.df_boletos, df_it)
+                st.success("✅ Cálculo concluído e salvo em boletos_calculados.")
                 st.cache_data.clear()
 
 df_calc = st.session_state.calc_nf.get(nf_sel)
