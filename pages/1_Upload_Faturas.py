@@ -30,6 +30,7 @@ sys.path.append(str(Path(__file__).parent.parent))
 from utils.pdf_parser import processar_lote_faturas, make_item_id
 from utils.calc_engine import calculate_boletos, infer_n_fases, compute_custo_disp
 from utils.boletos_adapter import calc_to_boletos_schema
+from utils.workflow_adapter import build_workflow_from_parse_results
 from utils.bigquery_client import (
     upsert_dataframe,
     execute_query,
@@ -38,6 +39,7 @@ from utils.bigquery_client import (
     TABLE_MEDIDORES,
     TABLE_CLIENTES,
     TABLE_BOLETOS,
+    TABLE_FATURAS_WORKFLOW,
 )
 
 APP_VERSION = "upload_v2_lote_cadastro"
@@ -138,6 +140,80 @@ def _load_clientes_for_ucs(ucs: List[str]) -> pd.DataFrame:
     """
     return execute_query(q, {"ucs": ucs})
 
+# -----------------------------------------------------------------------------
+# Workflow helpers (Etapa 1)
+# -----------------------------------------------------------------------------
+def _load_existing_workflow_by_nfs(nfs: List[str]) -> pd.DataFrame:
+    """
+    Carrega registros já existentes em faturas_workflow para classificar
+    inéditas vs já existentes no lote parseado.
+    """
+    if not nfs:
+        return pd.DataFrame()
+
+    q = f"""
+    SELECT
+        id,
+        nota_fiscal,
+        unidade_consumidora,
+        referencia,
+        is_inedita,
+        duplicada_de,
+        status_parse,
+        status_validacao,
+        status_calculo,
+        status_emissao,
+        arquivo_nome_original,
+        arquivo_hash,
+        pdf_uri,
+        created_at,
+        updated_at
+    FROM `{TABLE_FATURAS_WORKFLOW}`
+    WHERE id IN UNNEST(@nfs)
+    """
+    return execute_query(q, {"nfs": [str(x) for x in nfs if str(x).strip()]})
+
+
+def _build_hash_by_filename(uploaded_files) -> Dict[str, str]:
+    """
+    Gera hash simples do arquivo original enviado pelo usuário.
+    Nesta etapa usamos apenas os arquivos do lote atual, sem storage ainda.
+    """
+    import hashlib
+
+    out: Dict[str, str] = {}
+    for f in uploaded_files or []:
+        try:
+            raw = f.getvalue()
+            out[f.name] = hashlib.sha256(raw).hexdigest()
+        except Exception:
+            out[f.name] = ""
+    return out
+
+
+def _summarize_workflow_status(df_workflow: pd.DataFrame) -> Dict[str, int]:
+    if df_workflow is None or df_workflow.empty:
+        return {
+            "total_nf": 0,
+            "ineditas": 0,
+            "repetidas": 0,
+            "parseadas": 0,
+            "erro_parse": 0,
+        }
+
+    total_nf = len(df_workflow)
+    ineditas = int(df_workflow["is_inedita"].fillna(False).astype(bool).sum()) if "is_inedita" in df_workflow.columns else 0
+    repetidas = int(total_nf - ineditas)
+    parseadas = int((df_workflow.get("status_parse") == "parseado").sum()) if "status_parse" in df_workflow.columns else 0
+    erro_parse = int((df_workflow.get("status_parse") == "erro_parse").sum()) if "status_parse" in df_workflow.columns else 0
+
+    return {
+        "total_nf": int(total_nf),
+        "ineditas": int(ineditas),
+        "repetidas": int(repetidas),
+        "parseadas": int(parseadas),
+        "erro_parse": int(erro_parse),
+    }
 
 def _cadastro_motivo(cli_row: Optional[pd.Series]) -> Optional[str]:
     if cli_row is None:
