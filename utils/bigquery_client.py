@@ -21,11 +21,16 @@ PROJECT_ID = "football-data-science"
 DATASET_ID = "erb_tech"
 LOCATION = "southamerica-east1"
 
+# Tabelas principais existentes
 TABLE_FATURA_ITENS = f"{PROJECT_ID}.{DATASET_ID}.fatura_itens"
 TABLE_MEDIDORES = f"{PROJECT_ID}.{DATASET_ID}.medidores_leituras"
 TABLE_CLIENTES = f"{PROJECT_ID}.{DATASET_ID}.info_clientes"
 TABLE_BOLETOS = f"{PROJECT_ID}.{DATASET_ID}.boletos_calculados"
 TABLE_EDIT_LOG = f"{PROJECT_ID}.{DATASET_ID}.edit_log"
+
+# Novas tabelas de workflow / emissão
+TABLE_FATURAS_WORKFLOW = f"{PROJECT_ID}.{DATASET_ID}.faturas_workflow"
+TABLE_BOLETOS_EMISSAO_SICOOB = f"{PROJECT_ID}.{DATASET_ID}.boletos_emissao_sicoob"
 
 
 @st.cache_resource
