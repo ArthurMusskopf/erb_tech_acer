@@ -750,10 +750,26 @@ with tab_revisao:
 
     st.markdown("---")
 
-    cA, cB, cC = st.columns([1, 1, 1])
-    calc_btn = cA.button("🧮 Calcular esta NF", type="primary", width="stretch")
-    save_calc_btn = cB.button("💾 Salvar cálculo no BigQuery", width="stretch")
-    save_rev_btn = cC.button("💾 Substituir fatura no BigQuery (revisada)", width="stretch")
+    st.markdown("## ✅ Ações da fatura")
+
+    cA, cB, cC, cD = st.columns([1, 1, 1, 1])
+    validar_btn = cA.button("✅ Validar dados desta NF", width="stretch")
+    calc_btn = cB.button("🧮 Calcular esta NF", type="primary", width="stretch")
+    save_calc_btn = cC.button("💾 Salvar cálculo no BigQuery", width="stretch")
+    save_rev_btn = cD.button("💾 Substituir fatura no BigQuery (revisada)", width="stretch")
+
+    if validar_btn:
+        try:
+            _upsert_workflow_status(
+                str(nf_sel),
+                status_validacao="validada",
+                validado_por="app_upload",
+                validado_em=_now_utc(),
+                observacoes_append="dados_validados_na_tela_1",
+            )
+            st.success(f"✅ NF {nf_sel} marcada como VALIDADA no workflow.")
+        except Exception as e:
+            st.error(f"Falha ao validar NF no workflow: {e}")
 
     if save_rev_btn:
         try:
@@ -762,12 +778,15 @@ with tab_revisao:
                 _delete_nf_from_bigquery(str(nf_sel))
                 n_it = upsert_dataframe(it_reid, TABLE_FATURA_ITENS, "id")
                 n_med = upsert_dataframe(med_reid, TABLE_MEDIDORES, "id") if med_reid is not None and not med_reid.empty else 0
+
             _upsert_workflow_status(
                 str(nf_sel),
                 status_validacao="pendente",
                 observacoes_append="fatura_revisada_e_substituida_no_bigquery",
             )
+
             st.success(f"✅ NF {nf_sel} substituída no BigQuery: {n_it} itens, {n_med} medidores.")
+            st.info("ℹ️ Como a fatura foi revisada, o status de validação voltou para PENDENTE.")
         except Exception as e:
             st.error(f"Falha ao substituir no BigQuery: {e}")
 
@@ -827,11 +846,13 @@ with tab_revisao:
                 with st.spinner("Salvando cálculo em boletos_calculados (schema correto)..."):
                     df_bq = calc_to_boletos_schema(df_calc_save, df_it_edit, status="calculado")
                     upsert_dataframe(df_bq, TABLE_BOLETOS, key_column="id")
+
                 _upsert_workflow_status(
                     str(nf_sel),
                     status_calculo="calculada",
                     calculado_em=_now_utc(),
                 )
+
                 st.success("✅ Cálculo salvo em boletos_calculados.")
             except Exception as e:
                 st.error(f"Falha ao salvar cálculo: {e}")
