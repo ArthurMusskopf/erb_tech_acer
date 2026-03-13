@@ -180,6 +180,64 @@ def _load_existing_workflow_by_nfs(nfs: List[str]) -> pd.DataFrame:
     return execute_query(q, {"nfs": [str(x) for x in nfs if str(x).strip()]})
 
 
+def _upsert_workflow_status(
+    nf: str,
+    *,
+    status_parse: Optional[str] = None,
+    status_validacao: Optional[str] = None,
+    validado_por: Optional[str] = None,
+    validado_em: Optional[datetime] = None,
+    status_calculo: Optional[str] = None,
+    calculado_em: Optional[datetime] = None,
+    status_emissao: Optional[str] = None,
+    emitido_em: Optional[datetime] = None,
+    observacoes_append: Optional[str] = None,
+) -> None:
+    """
+    Atualiza a linha da NF em faturas_workflow sem perder os demais campos.
+    """
+    if not nf:
+        return
+
+    q = f"""
+    SELECT *
+    FROM `{TABLE_FATURAS_WORKFLOW}`
+    WHERE id = @nf
+    LIMIT 1
+    """
+    df_current = execute_query(q, {"nf": str(nf)})
+    if df_current is None or df_current.empty:
+        return
+
+    row = df_current.iloc[0].to_dict()
+
+    if status_parse is not None:
+        row["status_parse"] = status_parse
+
+    if status_validacao is not None:
+        row["status_validacao"] = status_validacao
+        row["validado_por"] = validado_por
+        row["validado_em"] = validado_em
+
+    if status_calculo is not None:
+        row["status_calculo"] = status_calculo
+        row["calculado_em"] = calculado_em
+
+    if status_emissao is not None:
+        row["status_emissao"] = status_emissao
+        row["emitido_em"] = emitido_em
+
+    if observacoes_append:
+        obs_atual = str(row.get("observacoes") or "").strip()
+        if obs_atual:
+            row["observacoes"] = f"{obs_atual} || {observacoes_append}"
+        else:
+            row["observacoes"] = observacoes_append
+
+    row["updated_at"] = _now_utc()
+    upsert_dataframe(pd.DataFrame([row]), TABLE_FATURAS_WORKFLOW, key_column="id")
+
+
 def _build_hash_by_filename(uploaded_files) -> Dict[str, str]:
     """
     Gera hash simples do arquivo original enviado pelo usuário.
@@ -446,6 +504,9 @@ with tab_upload:
                                     n_itens = 0
                                     n_med = 0
 
+                        except Exception as e:
+                            st.error(f"Erro ao salvar: {e}")
+                        else:
                             if resumo["repetidas"] > 0:
                                 st.warning(
                                     f"⚠️ Workflow salvo ({n_wf} linhas). "
@@ -455,8 +516,6 @@ with tab_upload:
                             st.success(
                                 f"✅ BigQuery atualizado: workflow={n_wf}, itens={n_itens}, medidores={n_med}"
                             )
-                        except Exception as e:
-                            st.error(f"Erro ao salvar: {e}")
 
 
 # =========================
@@ -546,8 +605,19 @@ with tab_revisao:
             df_calc, err = _calc_boleto_from_dfs(df_it_nf, df_med_nf)
             if err:
                 falhas.append({"numero": nf, "erro": err})
+                _upsert_workflow_status(
+                    str(nf),
+                    status_calculo="erro_calculo",
+                    calculado_em=_now_utc(),
+                    observacoes_append=f"erro_calculo_lote: {err}",
+                )
             else:
                 st.session_state.calc_por_nf[str(nf)] = df_calc.copy()
+                _upsert_workflow_status(
+                    str(nf),
+                    status_calculo="calculada",
+                    calculado_em=_now_utc(),
+                )
 
         if falhas:
             st.warning(f"⚠️ {len(falhas)} NF(s) falharam no cálculo do lote.")
@@ -637,6 +707,11 @@ with tab_revisao:
                 "updated_at": _now_utc(),
             }
             upsert_dataframe(pd.DataFrame([payload]), TABLE_CLIENTES, key_column="unidade_consumidora")
+            _upsert_workflow_status(
+                str(nf_sel),
+                status_validacao="pendente",
+                observacoes_append="cadastro_info_clientes_atualizado",
+            )
             st.success("✅ Cadastro salvo. Agora você pode calcular.")
         except Exception as e:
             st.error(f"Falha ao salvar info_clientes: {e}")
@@ -687,6 +762,11 @@ with tab_revisao:
                 _delete_nf_from_bigquery(str(nf_sel))
                 n_it = upsert_dataframe(it_reid, TABLE_FATURA_ITENS, "id")
                 n_med = upsert_dataframe(med_reid, TABLE_MEDIDORES, "id") if med_reid is not None and not med_reid.empty else 0
+            _upsert_workflow_status(
+                str(nf_sel),
+                status_validacao="pendente",
+                observacoes_append="fatura_revisada_e_substituida_no_bigquery",
+            )
             st.success(f"✅ NF {nf_sel} substituída no BigQuery: {n_it} itens, {n_med} medidores.")
         except Exception as e:
             st.error(f"Falha ao substituir no BigQuery: {e}")
@@ -694,9 +774,20 @@ with tab_revisao:
     if calc_btn:
         df_calc, err = _calc_boleto_from_dfs(df_it_edit, df_med_edit)
         if err:
+            _upsert_workflow_status(
+                str(nf_sel),
+                status_calculo="erro_calculo",
+                calculado_em=_now_utc(),
+                observacoes_append=f"erro_calculo_individual: {err}",
+            )
             st.error(err)
         else:
             st.session_state.calc_por_nf[str(nf_sel)] = df_calc.copy()
+            _upsert_workflow_status(
+                str(nf_sel),
+                status_calculo="calculada",
+                calculado_em=_now_utc(),
+            )
             st.success("✅ Cálculo concluído.")
 
     df_calc_show = st.session_state.calc_por_nf.get(str(nf_sel))
@@ -736,6 +827,11 @@ with tab_revisao:
                 with st.spinner("Salvando cálculo em boletos_calculados (schema correto)..."):
                     df_bq = calc_to_boletos_schema(df_calc_save, df_it_edit, status="calculado")
                     upsert_dataframe(df_bq, TABLE_BOLETOS, key_column="id")
+                _upsert_workflow_status(
+                    str(nf_sel),
+                    status_calculo="calculada",
+                    calculado_em=_now_utc(),
+                )
                 st.success("✅ Cálculo salvo em boletos_calculados.")
             except Exception as e:
                 st.error(f"Falha ao salvar cálculo: {e}")
